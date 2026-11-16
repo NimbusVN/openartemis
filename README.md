@@ -1,70 +1,38 @@
-# openartemis — artemisEngine
+# 介绍
 
-C++20 + SDL3 的 **artemisEngine（Artemis 系视觉小说引擎）**：直接运行
-Artemis 系 PFS 游戏资源包（`root.pfs`，可带分卷）。本仓库不含任何游戏资产；
-真包回归测试需要哪些游戏包由各测试文件头部注释与 `docs/TESTING.md` 说明
-（`OA_TEST_*_PFS` 环境变量指定路径）。
+openartemis的核心源码仓库，基于 SDL3 实现的 Artemis 系视觉小说引擎，直接运行 PFS 资源包（`root.pfs`）。源码构建在 [NimbusVN](https://github.com/NimbusVN/NimbusVN) 完成。
 
-开发基线 = **真实运行验证与画面/流程表现**：场景树/文本/媒体/存档/UI 事件/
-输入/转场/动画等已实现面逐项按实际表现校准，行为正确性由真实运行验证自证。
+# 目录结构说明
 
-- 文档：
-  - `docs/ARCHITECTURE.md` — **整体架构**（分层/数据流/模块职责/平台/构建/测试）
-  - `docs/TESTING.md` — `OA_*` 环境变量唯一权威表 + 测试布局与验收流
-  - `docs/PLATFORMS.md` — **Android APK / WebAssembly 构建与打包**（含壳层说明）
-- 引擎内核：`src/core`（宿主 `App` 在 runtime.cpp，SDL 只在 render 后端）+
-  SDL 层：`src/app`（main.cpp + platform/）
-- 工具：`tools/`（C++ CLI: opfs / psb / asb / oasave + 脚本: pfs.py / mkfixture.py /
-  cdp_dump.js；清单见 `tools/README.md`）
-- 平台壳：`android/`（Gradle + Java 启动器界面）+ `web/`（Emscripten 页面壳）
-- 调查工具：`tools/pfs.py`（Python 只读 PFS 查看器，开发期与 C++ 工具互验）
-
-## 构建与运行（CMake + vcpkg）
-
-```bash
-export VCPKG_ROOT=/path/to/vcpkg   # vcpkg 所在目录
-cmake --preset default
-cmake --build --preset default
-./build/default/src/app/openartemis /path/to/game/root.pfs   # 带窗运行（Esc 退出）
-./build/default/src/app/openartemis --renderer gles /path/to/game/root.pfs
-cd build/default && OA_TEST_FPM_PFS=/path/to/game/root.pfs ctest   # 全量测试（tests/ + tests/fpm/；真包测试需按各测试注释准备游戏包）
-# ASAN 诊断构建：cmake --preset asan && cmake --build --preset asan
+```
+📁 core/        # 引擎内核
+├── 📁 runtime/ # 运行时：App、场景树、脚本(Lua)、存档、IET/UI 事件
+├── 📁 render/  # 渲染：图层/字体/文本、SDL 与 GLES 后端
+├── 📁 media/   # 媒体：图片/音频/视频解码与解码池
+├── 📁 emote/   # E-mote 动态立绘（PSB 读取、骨骼、物理）
+├── 📁 fs/      # 文件系统：PFS 包与 PhysFS 抽象
+└── 📁 util/    # 工具包（sha1/charset/binary_stream）
+📁 environ/     # 宿主层：main.cpp + platform/（desktop / android / wasm）
+📁 third_party/ # vendored Lua 5.1.5
 ```
 
-- `src/app/main.cpp` 只做 SDL 层（窗口、事件转换、CLI、启动/退出）；引擎宿主
-  `oa::runtime::App` 在 `src/core/runtime/runtime.cpp`，SDK 类型不进入内核接口。
-- 对拍基础设施：`tools/parity/`（基准 `build/openartemis` → `build/parity/baseline`，
-  对拍 `build/test` / `build/test2`，见该目录 README）。
-- 环境变量总表、测试布局与快速验证：**`docs/TESTING.md`**（唯一权威 OA_* 清单）。
+# 依赖库说明
 
-依赖（全部 vcpkg manifest）：SDL3、freetype、libpng、libjpeg-turbo、libvorbis、
-libtheora、physfs（+ 可选 ffmpeg：桌面/Android 有，wasm 自动剔除）；Lua 5.1.5 为
-vendored 源码（`third_party/lua-5.1.5`）。不引入 stb 系库。
+- sdl3:跨平台核心（窗口/输入/音频/渲染）
+- lua 5.1.5:脚本语言（vendored 源码）
+- physfs:资源包文件系统
+- zlib:基础压缩算法
+- ffmpeg:视频解码（可选，未找到时自动关闭）
+- libvorbis/libtheora:音频与视频解码
+- libpng/libjpeg-turbo:图片解码
+- freetype:字体渲染
 
-## 其它平台（Android / WebAssembly）
+# 宏定义说明
 
-```bash
-# Android APK（arm64-v8a；需要 VCPKG_ROOT / ANDROID_NDK_HOME(r28) / ANDROID_HOME / JDK17）
-script\build-android.bat            # 原生库 + Gradle 打包 -> android\app\build\outputs\apk\debug\*.apk
+- OA_HAVE_FFMPEG:启用 ffmpeg 视频后端。
+- __ANDROID__/__EMSCRIPTEN__/__IPHONEOS__/桌面:平台差异由编译器自带宏区分。
 
-# 浏览器（Emscripten；需要 EMSDK：先跑 emsdk_env）
-script\build-wasm.bat               # -> build\wasm\src\app\index.html|index.js|index.wasm
-python web\serve.py <目录> 8080      # 浏览器打开 http://localhost:8080/index.html?pfs=root.pfs
-```
+# 许可
 
-两者共用同一份 `src/app/main.cpp`（SDL 层）与 `src/core/runtime`（引擎宿主
-`App`）；平台差异集中在 `src/app/platform/`（`platform_android.cpp` = 应用私有
-存档根 + 生命周期闩锁；`platform_wasm.cpp` = IDBFS `/save` 挂载 + 页面持久化/可见性
-钩子）。Android 启动器界面与网页壳分别改编自 krkrsdl3 的 Java 界面 / emscripten
-页面壳，细节见 `docs/PLATFORMS.md`。
-
-## 许可
-
-本项目采用 **MIT 或 GPL-3.0-or-later 二选一** 双许可
-（`SPDX-License-Identifier: MIT OR GPL-3.0-or-later`），Copyright (c) 2026 deepseek：
-
-- 选用 **MIT**：见 `LICENSE` 的 ALTERNATIVE A；
-- 选用 **GNU GPL v3 或更高版本**：见 `LICENSE` 的 ALTERNATIVE B。
-
-代码不含任何游戏资产；`third_party/`（如 Lua 5.1.5）与 vcpkg 依赖仍分别遵循
-各自的原始许可。
+**MIT 或 GPL-3.0-or-later 二选一**（`SPDX-License-Identifier: MIT OR GPL-3.0-or-later`），
+Copyright (c) 2026 deepseek，详见 `LICENSE`。代码不含任何游戏资产。

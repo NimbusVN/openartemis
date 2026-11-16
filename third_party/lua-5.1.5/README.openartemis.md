@@ -15,7 +15,7 @@ depends on:
   `luaL_openlibs`, before any script runs. The loop is the same scan with the
   same result; a Lua `TString` always carries its NUL terminator.
 
-Build integration lives in `src/core/CMakeLists.txt` via the `lua51` interface
+Build integration lives in the outer build tree's `cmake/openartemis/cmake_main.txt` via the `lua51` interface
 target; the engine layer decides which standard libraries to open at runtime
 (the engine restricts `os`/`io` — see the `OA_LUA_STDLIB` row in
-`docs/TESTING.md` and `src/core/runtime/runtime_lua.cpp` for the rationale).
+`docs/TESTING.md` and `core/runtime/runtime_lua.cpp` for the rationale).
