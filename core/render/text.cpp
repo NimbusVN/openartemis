@@ -537,6 +537,13 @@ void TextEngine::page_break(std::optional<int> backlog_param) {
     l.reveal_pending = false;
     l.reveal_clock_ms = 0;
     l.reveal_fresh = false;
+    // [sceout] hides the text that is on the page. A page break drops that
+    // text, so the flag must not outlive it: the next [print] starts a fresh
+    // page that has to be readable. (test13 backlog quick-jump: opening a UI
+    // [sceout]s the message layers, the jump path skips the normal UI-close
+    // [msg_show], and the replay repaints the page with [rp]+[print] — the
+    // stale flag kept that repainted page invisible.)
+    l.text_hidden = false;
     l.char_count = 0;
     ruby_open_ = false;
     bump_revision();

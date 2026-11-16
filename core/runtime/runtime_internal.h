@@ -101,6 +101,13 @@ struct GameRuntime::RuntimeState {
         std::map<int, std::set<int>> keymap_;
         std::string active_wait_icon_;
         bool exskip_active_ = false;
+        /// e:debugSkip{index=N}: the instruction the fast-forward stops on
+        /// (the framework's backlog "追いジャンプ" replays from the recorded
+        /// label and stops at the line that page was printed on). <0 = no
+        /// target (only a [stop 0="exskip"] boundary ends it).
+        int64_t exskip_target_ = -1;
+        /// The script the replay jumped into (first script change after start).
+        std::string exskip_script_;
         int script_status_ = 0;
     };
     struct InputDomain {
@@ -424,9 +431,22 @@ struct GameRuntime::RuntimeState {
     std::unique_ptr<oa::runtime::Interpreter> interpreter_;
     // [B] E: 读档后由恢复位置的那一行重跑重导出
     std::optional<oa::runtime::Wait> wait_;
+    /// A park and the queued script tail enqueued *behind* it. The framework
+    /// queues a page's cleanup after its wait ([@] -> [calllua click_exit]);
+    /// that tail must not run while the wait is live (it clears the game's
+    /// adv.click gate) but must still run, in order, once the wait releases.
+    /// Newly enqueued handler tags (hover effects, button UI calls) keep
+    /// draining — the park only blocks the script's own tail.
+    struct ParkedWait {
+        oa::runtime::Wait wait;
+        std::vector<oa::runtime::Instruction> tail;
+    };
+    std::vector<oa::runtime::Instruction> parked_tail_; // tail behind wait_
     // [C] E: 队列 tag 产生的停驻，必须等当前停驻结束后按 FIFO 武装
     // （KAG pendings 的等价物；绝不能替换当前停驻）。
-    std::deque<oa::runtime::Wait> pending_parks_;
+    std::deque<ParkedWait> pending_parks_;
+    void clear_pending_parks();
+    void prepend_live_tail(); // parked_tail_ -> front of the interpreter queue
     // [C] E: [trigger name=] 在队列排空时投递的命名 wake
     std::string pending_custom_;
     // [C] E: [tweenset] 组内 sync=1 目标；组关闭时合成一个 Tween park
@@ -454,7 +474,7 @@ struct GameRuntime::RuntimeState {
     /// automode voice gate — any channel listed in automode_syncse_ playing.
     bool automode_sync_blocked() const;
     // FPM e:debugSkip exskip fast-forward state machine.
-    void start_debug_skip();
+    void start_debug_skip(int64_t index = -1);
     void end_debug_skip();
     void update_control_skip_hold(const std::set<int>& keys_down);
     void dispatch_mode_input(const std::string& event_name);
@@ -482,6 +502,22 @@ struct GameRuntime::RuntimeState {
     std::function<void()> transition_capture_cb_;
     // [B] E: 合成 CallFrame 标记（script/line/stack 快照）；读档 reset
     std::optional<InlineEventFrame> inline_event_frame_;
+    /// A story/UI park suspended by a handler-issued [call] (frame id key).
+    /// The callee runs with a fresh execution state; popping the frame restores
+    /// the exact wait/pending/queue the caller was parked on.
+    struct ParkSuspension {
+        oa::runtime::Wait wait;
+        std::deque<ParkedWait> pending;
+        std::vector<oa::runtime::Instruction> tail;
+        bool has_wait = false;
+    };
+    std::map<uint64_t, ParkSuspension> park_suspensions_;
+    bool suspend_park_on_frame(uint64_t frame_id);
+    /// A queued (handler-issued) [jump] leaving the parked script: suspend the
+    /// page park on the jump's return frame. False = nothing worth returning
+    /// to (no park, or a bare [stop]) — the jump owns the execution then.
+    bool suspend_park_on_jump(uint64_t frame_id);
+    bool restore_park_from_frame(uint64_t frame_id);
     // [C] E: 宿主输入泵（边沿在每次 tick 后清）
     HostInput input_;
     // message-layer text domain lives in renderer_.text().

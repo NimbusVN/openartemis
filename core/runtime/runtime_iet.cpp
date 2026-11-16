@@ -2481,6 +2481,23 @@ static TagOutcome execute_tag(Interpreter& it, const Instruction& ins, bool appl
         }
     }
 
+    if (tag == "yesno") {
+        // [yesno file=...] is the framework's confirmation dialog, and the
+        // framework draws it itself: ui/dialog.lua exposes a global yesno(e,
+        // param) that builds 600.x from the CSV, sets t.yesno, and parks on
+        // [call asbmacro.asb dialog_open]. Artemis hands the tag to that Lua
+        // (tags.yesno stays commented out in the data), so the engine has to
+        // as well — swallowing the tag left t.yesno at 0, so quick save /
+        // quick load / suspend / emergency quietly did nothing and their
+        // closing [return] unwound the story's own call frame.
+        std::map<std::string, std::string> params;
+        for (const auto& [k, v] : ins.params) params[k] = eval.resolve_param(v).to_string();
+        const auto& lua = it.hooks().call_lua_function;
+        if (lua && lua("yesno", params, *it.current_script(), ins.line)) return out;
+        // No script-side dialog (a project that keeps the host widget): fall
+        // through to the generic handling below.
+    }
+
     if (tag == "yesno" || tag == "dialog") {
         // The host dialog/yesno/textfield widget is a host-side surface the
         if (const std::string* tf = ins.get("textfield"); tf && !tf->empty()) {
@@ -2615,6 +2632,17 @@ ExecutionResult Interpreter::run() {
         const Instruction ins = script.instructions[current_line_];
         if (on_step) on_step(*current_script_name_, current_line_, ins);
 
+        // Debug fast-forward boundary: the framework's backlog quick-jump
+        // records the instruction its page was printed on and replays from the
+        // chapter head. Ending the skip here — before that instruction runs —
+        // lets the runtime fire exskip_end (which repaints the page) and drain
+        // its tags in this same run, so the reader lands on a readable page
+        // instead of waiting for one more click.
+        if (hooks_.exskip_boundary &&
+            hooks_.exskip_boundary(*current_script_name_, current_line_)) {
+            continue;
+        }
+
         // if-chain fallthrough: sequential arrival at [elseif]/[else] means a
         // branch already ran; skip to the matching [/if].
         if (!arrived_by_jump &&
@@ -2697,7 +2725,8 @@ ExecutionResult Interpreter::run() {
                 if (call_stack_.size() >= 512) {
                     throw ScriptError("call", "call: stack too deep (512)", ins.line);
                 }
-                call_stack_.push_back(CallFrame{outcome.return_script, outcome.return_line});
+                call_stack_.push_back(
+                    CallFrame{outcome.return_script, outcome.return_line, next_frame_id_++});
                 const std::string target_script = outcome.file.empty() ? *current_script_name_
                                                                        : outcome.file;
                 if (!outcome.file.empty()) load_external_script(target_script);
@@ -2726,6 +2755,12 @@ ExecutionResult Interpreter::run() {
                     restore_macro_params(call_stack_.size() + 1);
                     current_script_name_ = frame.script;
                     current_line_ = frame.return_line;
+                    (void)origin_script;
+                    // The host may have parked this frame's continuation (a UI
+                    // session took the story park over). Restoring it ends the
+                    // step here; the restored wait owns the next input.
+                    if (frame.id && hooks_.frame_popped && hooks_.frame_popped(frame.id))
+                        return ExecutionResult::ParkRestored;
                     continue;
                 }
                 // [return] with an empty stack ENDS the script (the pre-fix
@@ -3421,6 +3456,39 @@ std::optional<ExecutionResult> Interpreter::flush_tag_queue() {
                 continue;
             case TagOutcomeKind::JumpExternal: {
                 queued_saw_jump_ = true;
+                if (hooks_.exskip_jump_target) hooks_.exskip_jump_target(outcome.file);
+                // A handler-issued jump that LEAVES the script a page park
+                // belongs to is an escape: the flow it enters ends with its own
+                // [return], and that return must land back on the parked page
+                // instead of unwinding the caller chain (test13 quick save:
+                // the closing [return] popped the story frame and turned a
+                // page). Same-script jumps (local gotos) keep the old shape:
+                // their [return] belongs to the [call] that encloses them.
+                const bool leaves_script =
+                    current_script_name_ && outcome.file != *current_script_name_;
+                // ...and only from the base context: once a [call] is in
+                // flight, that frame owns the way back (UI screens close
+                // through ReturnStack()/[return], and an extra frame here
+                // would swallow exactly that return).
+                bool inside_call = false;
+                for (const auto& f : call_stack_) {
+                    if (f.id != 0) {
+                        inside_call = true;
+                        break;
+                    }
+                }
+                if (leaves_script && !inside_call) {
+                    const uint64_t frame_id = next_frame_id_++;
+                    // The runtime only accepts this while a page click wait is
+                    // live; it then holds that park for the return.
+                    if (hooks_.queued_jump_frame && hooks_.queued_jump_frame(frame_id)) {
+                        if (call_stack_.size() >= 512) {
+                            throw ScriptError("jump", "jump: stack too deep (512)", 0);
+                        }
+                        call_stack_.push_back(
+                            CallFrame{*current_script_name_, current_line_, frame_id});
+                    }
+                }
                 load_external_script(outcome.file);
                 const Script* t = get_script(outcome.file);
                 const auto line = t->get_label_line(outcome.label);
@@ -3442,8 +3510,13 @@ std::optional<ExecutionResult> Interpreter::flush_tag_queue() {
                 }
                 // queued call: return_line = current_line (do NOT add 1)
                 const size_t pinned = call_stack_.size();
-                call_stack_.push_back(CallFrame{*current_script_name_, current_line_});
+                const uint64_t frame_id = next_frame_id_++;
+                call_stack_.push_back(CallFrame{*current_script_name_, current_line_, frame_id});
                 (void)pinned;
+                // A handler-issued call takes the current execution over: let
+                // the runtime park the live wait/queued tail on this frame so
+                // the caller resumes exactly where it was on [return].
+                if (hooks_.queued_call_frame) hooks_.queued_call_frame(frame_id);
                 const std::string target = outcome.file.empty() ? *current_script_name_
                                                                 : outcome.file;
                 if (!outcome.file.empty()) load_external_script(target);
@@ -3483,6 +3556,12 @@ std::optional<ExecutionResult> Interpreter::flush_tag_queue() {
                     restore_macro_params(call_stack_.size() + 1);
                     current_script_name_ = frame.script;
                     current_line_ = frame.return_line;
+                    (void)origin_script;
+                    // A frame that carried a suspended park resumes the caller
+                    // context right here: stop the drain (the restored wait
+                    // owns the next input).
+                    if (frame.id && hooks_.frame_popped && hooks_.frame_popped(frame.id))
+                        return ExecutionResult::ParkRestored;
                     continue;
                 }
                 // A queued [return] with an empty stack ENDS the script.

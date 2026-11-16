@@ -304,6 +304,14 @@ struct Wait {
     uint64_t auto_elapsed_ms = 0; // 每个停驻独立的 auto 计时（不再跨页残留）
     uint64_t se_deadline_ms = 0;  // 无活动 SE 时惰性建立的到点时刻
     bool script_owned = true;     // false = 队列 tag 停驻（release 不推进脚本）
+    /// 由调用帧恢复出来的停驻：恢复这一帧的输入已经属于（刚关闭的）UI，
+    /// 不能再被它放行，否则关闭 UI 的那一下会顺手翻掉剧情页。
+    bool restored = false;
+    /// 这个停驻是哪个脚本位置武装的。停驻只对那一行有效：处理器发起的
+    /// [jump] 把脚本挪走之后，再把它恢复回来就成了挂在错行上的"幽灵停驻"
+    /// （test13 backlog 追いジャンプ：弹窗回答后每按一下都在同一行打转）。
+    std::string owner_script;
+    size_t owner_line = 0;
     /// A video skip already queued its finish event (the finish handler runs
     /// first and may enqueue the transition the skip should play).
     bool finish_requested = false;
@@ -387,11 +395,18 @@ enum class ExecutionResult {
     /// 单次 run() 用完了每帧 tag 预算（轮询型主循环）：既没停也没结束，
     /// 下一帧从当前位置继续。宿主**不要**因此清场或算作完成。
     BudgetExhausted,
+    /// 一个 [return] 弹出了携带“挂起停驻上下文”的调用帧：宿主已经把
+    /// 被挂起的等待/队列尾部恢复成当前执行状态，解释器必须立即停止推进
+    /// （否则会越过恢复出的停驻、把剧情直接翻到下一页）。
+    ParkRestored,
 };
 
 struct CallFrame {
     std::string script;
     size_t return_line = 0;
+    /// Frame identity for the host's suspended-park bookkeeping. 0 = synthetic
+    /// marker (inline-event anchor, no continuation attached).
+    uint64_t id = 0;
 };
 
 // Host-side capability hooks (filled by the engine runtime and its Lua layer).
@@ -465,6 +480,30 @@ struct InterpreterHooks {
     /// 字体测量流程）。
     /// 无钩子时查询落 0。
     std::function<std::tuple<double, double, double>()> message_layer_metrics;
+    /// A queued (handler-issued) [call] pushed `frame_id`. The runtime suspends
+    /// the live park (wait + pending parks + queued tail) on this frame so the
+    /// story can resume exactly where it was when the callee returns.
+    std::function<void(uint64_t frame_id)> queued_call_frame;
+    /// A queued (handler-issued) [jump] that leaves the parked script: the
+    /// runtime suspends the page park on a return frame when it returns true
+    /// (the interpreter then pushes that frame, so the flow's own [return]
+    /// lands back on the page). False = no page park; the jump owns the flow.
+    std::function<bool(uint64_t frame_id)> queued_jump_frame;
+    /// A queued [jump file=X] executed. The framework's backlog replay jumps
+    /// to the recorded script right after e:debugSkip{index=N}; the runtime
+    /// notes X so the recorded instruction index is only compared inside the
+    /// script it belongs to.
+    std::function<void(const std::string&)> exskip_jump_target;
+    /// Called before each instruction while the interpreter is at `script`:
+    /// `line` is the instruction about to run. Returns true when the runtime
+    /// ended a debug fast-forward here; the loop then drains the tags that
+    /// end-of-replay flow queued (exskip_end) before executing the line, so
+    /// the page is redrawn inside the same run instead of waiting for input.
+    std::function<bool(const std::string& script, size_t line)> exskip_boundary;
+    /// A [return] popped `frame_id`. Returns true when the runtime restored a
+    /// suspended park: stepping must stop immediately (ExecutionResult::
+    /// ParkRestored) instead of running on past the restored wait.
+    std::function<bool(uint64_t frame_id)> frame_popped;
 };
 
 class Interpreter {
@@ -529,6 +568,12 @@ public:
     std::vector<Instruction> take_tag_queue();
     void restore_tag_queue(std::vector<Instruction> items);
     size_t queued_tag_count() const { return tag_queue_.size(); }
+    /// Put a parked script tail back in front of the queue (a released park's
+    /// deferred tags run before anything enqueued while it was live).
+    void prepend_tags(std::vector<Instruction> items) {
+        if (items.empty()) return;
+        tag_queue_.insert(tag_queue_.begin(), items.begin(), items.end());
+    }
 
     /// Queue an engine tag the interpreter executes from its tag queue (the
     /// drain that Lua e:enqueueTag uses; the runtime enqueues lytween
@@ -680,6 +725,8 @@ private:
     /// True when the last run() ended by yielding a wait/stop to the host.
     /// queue_hold_depth_ is released on that edge (see flush_tag_queue).
     bool parked_ = false;
+    // Call-frame identity source (see CallFrame::id).
+    uint64_t next_frame_id_ = 1;
     // Macro tag -> defining file ([macroadd]); see macros().
     std::map<std::string, std::string> macros_;
     // Macro parameter scope: tag params become plain variables for the

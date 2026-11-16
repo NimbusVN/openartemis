@@ -429,6 +429,41 @@ void GameRuntime::RuntimeState::open_project(std::string_view platform) {
     save_.savepath_ = sanitize_savepath(rt_->project_.config.savepath);
     interpreter_->set_variable("s.savepath", oa::runtime::Value::make_string(save_.savepath_));
     interpreter_->hooks().frame_number = [this] { return tick_count_; };
+    // A handler-issued [call] takes the running context over. Park the live
+    // wait (and the parks queued behind it) on the new frame; the [return]
+    // that pops it restores the exact pre-call state. This is what makes a UI
+    // session (save/load/config/backlog) return to the *same story page*
+    // instead of running on past it.
+    interpreter_->hooks().queued_call_frame = [this](uint64_t frame_id) {
+        suspend_park_on_frame(frame_id);
+    };
+    // A handler-issued [jump] into another script is returnable the same way
+    // when it interrupts a page park (the framework's `[jump <flow>] ...
+    // [return]` idiom). The hook reports whether a park was suspended, i.e.
+    // whether the jump needs a return frame at all.
+    interpreter_->hooks().queued_jump_frame = [this](uint64_t frame_id) {
+        return suspend_park_on_jump(frame_id);
+    };
+    interpreter_->hooks().frame_popped = [this](uint64_t frame_id) {
+        return restore_park_from_frame(frame_id);
+    };
+    interpreter_->hooks().exskip_jump_target = [this](const std::string& file) {
+        if (!control_.exskip_active_ || control_.exskip_target_ < 0) return;
+        if (control_.exskip_script_.empty()) control_.exskip_script_ = file;
+    };
+    interpreter_->hooks().exskip_boundary = [this](const std::string& script,
+                                                   size_t line) {
+        // e:debugSkip{index=N}: stop at the instruction the backlog page was
+        // printed on. The index only means something inside the script the
+        // replay jumped into, and only after that jump happened — before it we
+        // are still in the caller, whose line can already be past N.
+        if (!control_.exskip_active_) return false;
+        if (control_.exskip_target_ < 0 || control_.exskip_script_.empty()) return false;
+        if (script != control_.exskip_script_) return false;
+        if (line < size_t(control_.exskip_target_)) return false;
+        end_debug_skip();
+        return true;
+    };
     interpreter_->hooks().file_loader = [this](const std::string& name)
         -> std::optional<std::vector<uint8_t>> {
         return fs_->read(interpreter_->resolve_magic_path(name));
@@ -678,10 +713,12 @@ void GameRuntime::RuntimeState::reset_domains() {
     pointer_.hovered_.clear();
     pointer_.drag_layer_.clear();
     inline_event_frame_.reset();
+    park_suspensions_.clear();
     save_.screenshot_.valid = false;
     save_.capture_pending_ = false;
     renderer_.stop_all_delete();
     wait_.reset();
+    parked_tail_.clear();
     pending_parks_.clear();
     pending_custom_.clear();
     pending_sync_tweens_.clear();
@@ -770,10 +807,7 @@ void GameRuntime::RuntimeState::wire_lua_host() {
     host.now_ms = [this] { return now_ms_; };
     host.get_script_status = [this] { return control_.script_status_; };
     host.set_script_status = [this](int s) { control_.script_status_ = s; };
-    host.debug_skip_start = [this](int64_t index) {
-        (void)index;
-        start_debug_skip();
-    };
+    host.debug_skip_start = [this](int64_t index) { start_debug_skip(index); };
     host.is_down = [this](int key) {
         if (const auto it = input_state_.overrides_.find(key); it != input_state_.overrides_.end()) {
             if (it->second & 4) return true;
@@ -996,6 +1030,15 @@ void GameRuntime::RuntimeState::arm_park(oa::runtime::Wait w, bool script_owned)
     w.armed_tick = tick_count_;
     w.auto_elapsed_ms = 0;
     w.se_deadline_ms = 0;
+    // The line this park belongs to: a park is only meaningful while the script
+    // still sits on it (see restore_park_from_frame).
+    if (const std::string* script = interpreter_ ? interpreter_->current_script() : nullptr) {
+        w.owner_script = *script;
+        w.owner_line = interpreter_->current_line();
+    } else {
+        w.owner_script.clear();
+        w.owner_line = 0;
+    }
     normalize_wait(w);
     wait_ = std::move(w);
 }
@@ -1130,19 +1173,42 @@ bool is_bare_stop(const oa::runtime::Wait& w) {
 }
 } // namespace
 
+void GameRuntime::RuntimeState::clear_pending_parks() {
+    // Their tails hold already-enqueued script tags: put them back so nothing
+    // is silently dropped when the queue parks are superseded.
+    for (auto& p : pending_parks_) {
+        interpreter_->prepend_tags(std::move(p.tail));
+    }
+    pending_parks_.clear();
+}
+
+void GameRuntime::RuntimeState::prepend_live_tail() {
+    if (!parked_tail_.empty()) {
+        interpreter_->prepend_tags(std::move(parked_tail_));
+        parked_tail_.clear();
+    }
+}
+
 void GameRuntime::RuntimeState::run_until_wait() {
     if (!interpreter_) return;
     const oa::runtime::ExecutionResult r = interpreter_->run();
     if (r == oa::runtime::ExecutionResult::Wait) {
+        const bool from_queue = interpreter_->last_wait_from_queue();
         if (auto park = park_from_event(interpreter_->last_wait_event())) {
-            arm_park(std::move(*park), !interpreter_->last_wait_from_queue());
+            arm_park(std::move(*park), !from_queue);
+            // The tags still queued behind this wait are the script's own
+            // continuation (the page's click_exit cleanup): hold them until the
+            // wait releases instead of running them under the live page.
+            if (from_queue) parked_tail_ = interpreter_->take_tag_queue();
             // A queued UI wait that arrived before this bare stop must take
             // over now, or its click wake can never be reached (the opening
             // logo's eqwait was exactly this shape).
             if (wait_ && is_bare_stop(*wait_) && !pending_parks_.empty()) {
-                oa::runtime::Wait next = std::move(pending_parks_.front());
+                ParkedWait next = std::move(pending_parks_.front());
                 pending_parks_.pop_front();
-                arm_park(std::move(next), false);
+                arm_park(std::move(next.wait), false);
+                prepend_live_tail();
+                parked_tail_ = std::move(next.tail);
             }
         }
     }
@@ -1153,11 +1219,10 @@ void GameRuntime::RuntimeState::run_until_wait() {
 
 void GameRuntime::RuntimeState::drain_parked_queue() {
     if (!interpreter_) return;
-    // a queued park can never replace the running one. The tail
-    // still drains for UI responsiveness (non-wait tags apply); each wait it
-    // hits becomes the next pending park in FIFO order.
-    // (pending_parks_ intentionally does not hold the tail: real game UI
-    // flows enqueue close/cleanup tags behind a wait.)
+    // A park never blocks user input: tags queued by pointer handlers (hover
+    // feedback, the message-window buttons' UI calls) keep draining. Only the
+    // script's own tail queued behind the wait is held (parked_tail_) and runs
+    // in order once the wait releases.
     bool saw_call = false;
     bool saw_jump = false;
     bool paused = false;
@@ -1173,6 +1238,12 @@ void GameRuntime::RuntimeState::drain_parked_queue() {
         const size_t line_before = interpreter_->current_line();
         const size_t stack_before = interpreter_->call_stack().size();
         const oa::runtime::ExecutionResult r = interpreter_->run_queued();
+        if (r == oa::runtime::ExecutionResult::ParkRestored) {
+            // A [return] restored the caller's suspended park (wait + pending
+            // parks + queue tail). Nothing in this drain may run behind it.
+            settle();
+            return;
+        }
         const bool moved = script_before != interpreter_->current_script() ||
                            line_before != interpreter_->current_line() ||
                            stack_before != interpreter_->call_stack().size();
@@ -1180,29 +1251,42 @@ void GameRuntime::RuntimeState::drain_parked_queue() {
             paused = true;
             if (auto park = park_from_event(interpreter_->last_wait_event())) {
                 park->script_owned = false;
+                ParkedWait next;
+                next.wait = std::move(*park);
+                if (interpreter_->last_wait_from_queue())
+                    next.tail = interpreter_->take_tag_queue();
                 // A UI flow may take over a bare script stop (title/logo/menu
                 // parks). Story pacing parks (click/timed/reveal/keys) are
                 // protected: their waits go to pending_parks_ instead.
                 const bool stop_park = wait_ && is_bare_stop(*wait_);
                 if (wait_ && (!wait_->script_owned || stop_park)) {
                     // Same UI flow, or a bare stop handing over: latest-wins.
-                    // Deferring behind the live park stalls opening logo /
-                    // config / preview loops (the click never reaches the
-                    // queued eqwait).
+                    // The dropped parks' deferred tails still have to run; run
+                    // them in enqueue order in front of the new park's tail.
+                    std::vector<oa::runtime::Instruction> merged =
+                        std::move(parked_tail_);
+                    for (auto& p : pending_parks_) {
+                        merged.insert(merged.end(), p.tail.begin(), p.tail.end());
+                    }
+                    merged.insert(merged.end(), next.tail.begin(), next.tail.end());
                     pending_parks_.clear();
-                    arm_park(std::move(*park), false);
+                    arm_park(std::move(next.wait), false);
+                    parked_tail_ = std::move(merged);
                 } else {
-                    park->seq = 0; // assigned by arm_park when it becomes current
-                    pending_parks_.push_back(std::move(*park));
+                    next.wait.seq = 0; // assigned by arm_park when it becomes current
+                    pending_parks_.push_back(std::move(next));
                 }
             }
             settle();
-            return; // tail stays queued; the running park still governs
+            return; // the running park still governs
         }
         if (moved) {
-            // queued jump/call/return changed position: the UI flow takes over.
+            // A queued jump/return changed position: the UI flow takes over;
+            // the dropped park's script tail still owes its cleanup tags.
             wait_.reset();
-            pending_parks_.clear();
+            interpreter_->prepend_tags(std::move(parked_tail_));
+            parked_tail_.clear();
+            clear_pending_parks();
             pending_custom_.clear();
             pending_sync_tweens_.clear();
             settle();
@@ -1799,14 +1883,18 @@ bool GameRuntime::RuntimeState::waiting_stop() const {
 
 // Debug-skip fast-forward: non-Stop waits release instantly; the
 // [stop 0="exskip"] row ends the fast-forward. Details: docs/RUNTIME_NOTES.md.
-void GameRuntime::RuntimeState::start_debug_skip() {
+void GameRuntime::RuntimeState::start_debug_skip(int64_t index) {
     if (control_.exskip_active_) return;
     control_.exskip_active_ = true;
+    control_.exskip_target_ = index > 0 ? index : -1;
+    control_.exskip_script_.clear();
 }
 
 void GameRuntime::RuntimeState::end_debug_skip() {
     if (!control_.exskip_active_) return;
     control_.exskip_active_ = false;
+    control_.exskip_target_ = -1;
+    control_.exskip_script_.clear();
     reveal_all_text(); // no half-revealed page left behind at the boundary
     if (interpreter_) {
         try {
@@ -1945,6 +2033,9 @@ bool GameRuntime::RuntimeState::resolve_wait(uint64_t delta_ms, bool click_cmd,
     oa::runtime::Wait& w = *wait_;
     using W = oa::runtime::Wait;
     const bool armed_now = (w.armed_tick == tick_count_);
+    // A park restored from a call frame re-enters on the tick that closed the
+    // UI; that tick's press/decide already belonged to the UI.
+    const bool restored_now = w.restored && armed_now;
     const bool skipping = control_.skip_active_ || control_.exskip_active_;
     const bool force_skip = control_.exskip_active_;
 
@@ -1961,7 +2052,12 @@ bool GameRuntime::RuntimeState::resolve_wait(uint64_t delta_ms, bool click_cmd,
         const bool page_click =
             w.stage == W::Stage::None && !w.timed() && w.keys.empty() &&
             !w.on_reveal_done && !w.reveal_clear && w.can(W::OnClick);
-        if (page_click && !text().is_reveal_complete()) {
+        // The "complete the page, advance on the next tick" rule exists so one
+        // human press is not spent on two commands. A forced fast-forward has
+        // no press to conserve: completing the reveal and releasing the page in
+        // the same tick is what keeps a backlog quick-jump inside one tick
+        // instead of flashing one intermediate page per frame.
+        if (page_click && !text().is_reveal_complete() && !force_skip) {
             text().reveal_all();
         } else if (fire_skip(w, force_skip)) {
             return true;
@@ -1975,13 +2071,14 @@ bool GameRuntime::RuntimeState::resolve_wait(uint64_t delta_ms, bool click_cmd,
                             input_state_.down_edges_.count(kKeyMouseRight) > 0;
     const bool video_stage =
         w.stage == W::Stage::Video || w.stage == W::Stage::VideoLayer;
-    if (decide_cmd && w.has(W::WakeDecide)) {
+    if (!restored_now && decide_cmd && w.has(W::WakeDecide)) {
         if (fire_click(w, true)) return true;
-    } else if ((click_cmd || (phys_click && video_stage)) && w.has(W::WakeClick)) {
+    } else if (!restored_now && (click_cmd || (phys_click && video_stage)) &&
+               w.has(W::WakeClick)) {
         if (fire_click(w, false)) return true;
     }
     // [exkey]: these key edges release the park.
-    if (w.has(W::WakeKeys)) {
+    if (!restored_now && w.has(W::WakeKeys)) {
         for (const int k : w.keys) {
             if (input_state_.down_edges_.count(k)) return true;
         }
@@ -2056,15 +2153,18 @@ void GameRuntime::RuntimeState::advance_wait() {
     const bool has_pending = !pending_parks_.empty();
     wait_.reset();
     if (page_wait_release) text().anchor_active_to_content();
-    // when a queue park is waiting, it takes over without moving
-    // the script cursor (the queued tag was not an inline instruction). The
-    // same rule preserves the old behaviour when a queue park replaced a
-    // script park: the cursor stays on the script's original wait row.
+    // The next wake may release the script line (an inline wait) or not (a
+    // queue wait: the cursor already points after its tag). Pending queue
+    // parks own the release themselves.
     interpreter_->release_park(script_owned && !has_pending);
+    // The held script tail belongs after this wait: run it before any tag that
+    // arrived while the park was live.
+    prepend_live_tail();
     if (has_pending) {
-        oa::runtime::Wait next = std::move(pending_parks_.front());
+        ParkedWait next = std::move(pending_parks_.front());
         pending_parks_.pop_front();
-        arm_park(std::move(next), false);
+        arm_park(std::move(next.wait), false);
+        parked_tail_ = std::move(next.tail);
     }
 }
 
@@ -2459,6 +2559,16 @@ void GameRuntime::RuntimeState::begin_inline_event_frame(bool force) {
     }
     // Arm at input anchor parks (or unconditionally for a handler that queued tags).
     if (!force && wait_ && !wait_->is_input_anchor()) return;
+    // The marker is the handler's *only* way back at a top-level park. A frame
+    // that carries a suspended park (a UI session entered over the story with a
+    // handler-issued [call]) already owns the return path: the data's
+    // `[jump <close label>] ... [return]` idiom must unwind to that frame and
+    // restore the story park, not land on the UI's [stop] through a marker
+    // (test13: closing the backlog never came back to the story).
+    {
+        const auto& cs = interpreter_->call_stack();
+        if (!cs.empty() && park_suspensions_.count(cs.back().id) != 0) return;
+    }
     const std::string* script = interpreter_->current_script();
     if (!script) return;
     const size_t line = interpreter_->current_line();
@@ -2498,6 +2608,85 @@ void GameRuntime::RuntimeState::settle_inline_event_frame(bool paused, bool has_
     // Nothing can pop the marker: tear it down and restore the pre-arm stack.
     inline_event_frame_.reset();
     interpreter_->set_call_stack(rec.stack);
+}
+
+bool GameRuntime::RuntimeState::suspend_park_on_jump(uint64_t frame_id) {
+    // A handler-issued [jump] into another script is an escape from the page
+    // the player is reading: the flow it enters ends with its own [return],
+    // and that return has to land back on that page — with its park and the
+    // script tail queued behind it — instead of unwinding the caller chain
+    // (test13: quick save / quick load ended by popping the story frame, which
+    // turned a page on the way back).
+    // Only a page CLICK wait qualifies. A [stop] or a timer belongs to a flow
+    // that is already over (UI screens, menus): the jump owns the execution
+    // there, and their own ReturnStack()/[return] choreography must not meet an
+    // extra frame (closing the backlog goes through exactly that path).
+    if (!interpreter_ || frame_id == 0) return false;
+    if (!wait_ || !wait_->waiting_click()) return false;
+    return suspend_park_on_frame(frame_id);
+}
+
+bool GameRuntime::RuntimeState::suspend_park_on_frame(uint64_t frame_id) {
+    if (!interpreter_ || frame_id == 0) return false;
+    // A call only takes a continuation over when something is actually parked
+    // (or queued behind a park). A call from a running script keeps the same
+    // execution context and must not suspend anything.
+    if (!wait_ && pending_parks_.empty()) return false;
+    ParkSuspension s;
+    if (wait_) {
+        s.wait = std::move(*wait_);
+        s.has_wait = true;
+        wait_.reset();
+    }
+    s.tail = std::move(parked_tail_);
+    parked_tail_.clear();
+    s.pending = std::move(pending_parks_);
+    pending_parks_.clear();
+    pending_custom_.clear();
+    pending_sync_tweens_.clear();
+    park_suspensions_[frame_id] = std::move(s);
+    return true;
+}
+
+bool GameRuntime::RuntimeState::restore_park_from_frame(uint64_t frame_id) {
+    const auto it = park_suspensions_.find(frame_id);
+    if (it == park_suspensions_.end()) return false;
+    ParkSuspension s = std::move(it->second);
+    park_suspensions_.erase(it);
+    const auto at_park_line = [this](const oa::runtime::Wait& w) {
+        const std::string* script = interpreter_ ? interpreter_->current_script() : nullptr;
+        return script && w.owner_script == *script && w.owner_line == interpreter_->current_line();
+    };
+    // A park belongs to the script line that armed it. A handler-issued [jump]
+    // can move the script while the frame holding the park is still open (the
+    // framework queues [call <file> last] preload rows right next to such
+    // jumps); restoring the park on the new line leaves the story waiting at a
+    // line it already left, and every later press re-runs that same line
+    // forever (test13 backlog row jump: the confirmation dialog answered once
+    // and then nothing responded).
+    if (s.has_wait && !at_park_line(s.wait)) {
+        // Stale: hand its deferred tail back so no cleanup is lost, then let
+        // execution continue from where the flow actually is.
+        if (!s.tail.empty()) interpreter_->prepend_tags(std::move(s.tail));
+        s.tail.clear();
+        s.has_wait = false;
+    }
+    // The callee may have left its own park behind (a UI screen that closed
+    // without returning). A park still standing on THIS line is legitimate and
+    // stays; one left on another line goes.
+    if (wait_ && !at_park_line(*wait_)) wait_.reset();
+    if (s.has_wait) {
+        wait_ = std::move(s.wait);
+        // Re-arm for THIS tick and refuse this tick's input: the press that
+        // closed the UI is the UI's command, not the story's next page turn.
+        wait_->armed_tick = tick_count_;
+        wait_->seq = ++wait_seq_;
+        wait_->auto_elapsed_ms = 0;
+        wait_->restored = true;
+    }
+    if (!s.tail.empty()) parked_tail_ = std::move(s.tail);
+    pending_parks_ = std::move(s.pending);
+    return wait_.has_value();
 }
 
 void GameRuntime::RuntimeState::force_pointer_drag(const std::string& layer_id) {

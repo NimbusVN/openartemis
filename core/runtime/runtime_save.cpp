@@ -544,10 +544,12 @@ size_t GameRuntime::RuntimeState::reset_ephemeral_on_load() {
     transition().clear(); clr();
     pointer_.hovered_.clear(); pointer_.drag_layer_.clear(); clr();
     inline_event_frame_.reset(); clr();
+    park_suspensions_.clear(); clr();
     save_.screenshot_.valid = false; clr();
     save_.capture_pending_ = false; clr();
     renderer_.stop_all_delete();
     wait_.reset(); clr();
+    parked_tail_.clear(); clr();
     pending_parks_.clear(); clr();
     pending_custom_.clear(); clr();
     pending_sync_tweens_.clear(); clr();
