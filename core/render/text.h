@@ -150,6 +150,10 @@ struct MessageLayer {
     FontDesc font;
     std::vector<FontDesc> font_stack;
     bool text_hidden = false;
+    /// [lydel] took the scene node away: the layer is not on screen any more
+    /// and must not be written into a save (a [chgmsg] on the same id clears
+    /// it — the framework starting a new page on that row).
+    bool scene_gone = false;
     std::vector<PageUnit> page;
     uint64_t generation = 0;
     // reveal/scetween/backlog
@@ -179,6 +183,13 @@ public:
     void switch_layer(std::optional<std::string> id, bool stack,
                       std::optional<int> layered);
     void pop_layer();
+    /// [lydel]: the scene node (and its subtree) is gone. Hide the message
+    /// layers instead of erasing them: the framework initialises rows like the
+    /// backlog's 500.100.x ONCE at boot (font box + page), and a later screen
+    /// rebuild only re-prints into the same layer — erasing it would lose the
+    /// layout. Hidden layers stay out of visible_content_layers() and out of
+    /// save snapshots; [chgmsg] makes a layer visible again.
+    void hide_layer(const std::string& id, bool subtree = true);
     // font 族
     void apply_font(const std::map<std::string, std::string>& p);
     void font_init();

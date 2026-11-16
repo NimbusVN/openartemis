@@ -333,10 +333,28 @@ void TextEngine::switch_layer(std::optional<std::string> id, bool stack,
     if (!id || id->empty()) id = anon_id();
     active_ = *id;
     MessageLayer& l = active_mut();
+    // A [lydel] hid this layer because its scene node went; switching to it is
+    // the framework starting a new page on the same row, so it is visible
+    // again (the layout/font box the boot pass installed is still there).
+    if (l.text_hidden) l.text_hidden = false;
+    if (l.scene_gone) l.scene_gone = false;
     // layered only changes when the tag explicitly carries it — a
     if (layered.has_value()) l.layered = *layered == 1;
 
     // NO cross-layer geometry/font inheritance. A message
+    bump_revision();
+}
+
+void TextEngine::hide_layer(const std::string& id, bool subtree) {
+    if (id.empty()) return;
+    const auto matches = [&](const std::string& k) {
+        return k == id ||
+               (subtree && k.size() > id.size() + 1 &&
+                k.compare(0, id.size(), id) == 0 && k[id.size()] == '.');
+    };
+    for (auto& [lid, l] : layers_) {
+        if (matches(lid)) l.scene_gone = true;
+    }
     bump_revision();
 }
 
@@ -765,7 +783,7 @@ std::optional<ClickWaitPlacement> TextEngine::click_wait_placement(bool page_end
 std::vector<std::string> TextEngine::visible_content_layers() const {
     std::vector<std::string> out;
     for (const auto& [id, l] : layers_) {
-        if (l.text_hidden) continue;
+        if (l.text_hidden || l.scene_gone) continue;
         bool has = false;
         for (const PageUnit& u : l.page) {
             if (u.kind != PageUnit::Kind::Newline && !u.data.empty()) {

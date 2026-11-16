@@ -21,6 +21,10 @@
 #include "core/runtime/runtime_save.h"
 #include "core/version.h"
 
+extern "C" {
+#include "lua.h"
+}
+
 namespace oa::runtime {
 
 namespace {
@@ -873,6 +877,11 @@ void GameRuntime::RuntimeState::tick(uint64_t delta_ms, const FrameInput& in) {
     transition().clear_finished(now_ms_);
     // Drop the inline-event marker once its frame left the stack.
     refresh_inline_event_frame();
+    // A closed UI screen may have left its own frames on the stack: hand the
+    // page it was opened from back before input is resolved.
+    if (save_ui_recovery_frames_ > 0 && --save_ui_recovery_frames_ == 0)
+        save_ui_recovery_ = false;
+    settle_ui_session_park();
     // [alldelete]: the render fade clock expired -> clear the scene + text.
     if (renderer_.all_delete_expired(now_ms_)) finish_all_delete();
     // Cursor-warp emulation when the host cannot warp (hidden/headless).
@@ -1585,6 +1594,7 @@ bool GameRuntime::RuntimeState::apply_scene_event(const oa::runtime::Event& e) {
     }
     if (e.kind == K::LayerDelete) {
         scene().remove(e.id);
+        text().hide_layer(e.id, true);
         renderer_.note(RNote::Layer);
         // a deleted layer (or subtree) releases its emote
         // player (fgdel/lydel2 flows) — players whose id equals the deleted
@@ -2688,6 +2698,112 @@ bool GameRuntime::RuntimeState::restore_park_from_frame(uint64_t frame_id) {
     pending_parks_ = std::move(s.pending);
     return wait_.has_value();
 }
+
+bool GameRuntime::RuntimeState::ui_session_open() {
+    if (!interpreter_) return false;
+    lua_State* L = interpreter_->lua_bridge().state();
+    if (!L) return false;
+    const int top = lua_gettop(L);
+    bool open = false;
+    lua_getglobal(L, "adv");
+    if (lua_istable(L, -1)) {
+        lua_getfield(L, -1, "func");
+        open = !lua_isnil(L, -1);
+    }
+    lua_settop(L, top);
+    return open;
+}
+
+void GameRuntime::RuntimeState::settle_ui_session_park() {
+    // The framework's UI screens are [call]s into system/ui.asb: opening one
+    // suspends the page park on the frame the call pushed. Closing it clears
+    // adv.func, but the frames the screen opened do not always unwind —
+    // ui_return jumps back into the UI script, and its [return] lands on the
+    // script's own [stop], which then re-arms on every press while the story
+    // page sits below it in the stack (test13: save/load left the game alive
+    // but deaf, cursor on ui.asb:1 with adv.func already nil).
+    //
+    // When the session is gone and the live wait still belongs to the
+    // framework script the screen opened, roll the stack back to the page and
+    // hand it back to the reader.
+    if (!save_ui_recovery_ || !interpreter_ || !wait_) return;
+    const std::string* cur = interpreter_->current_script();
+    // Only a framework-side wait is a candidate: the story page's own park is a
+    // scenario script and must never be rolled back this way.
+    if (!cur || wait_->owner_script.compare(0, 7, "system/") != 0) return;
+    if (ui_session_open()) return;
+
+    // The screen never ran the framework's return-to-game tail; that is where
+    // the ADV keys, the message-window buttons and the vsync mode are put back.
+    // Without it the page is on screen but the bar under it is dead (its fade-in
+    // never advances) and a press falls through to the story. Titles that do
+    // not have these helpers simply skip them.
+    const auto run_return_tail = [this] {
+        for (const char* fn : {"return_to_game_common2", "key_start_adv", "mw_btnon"}) {
+            try {
+                (void)interpreter_->lua_bridge().call_function(fn, {});
+            } catch (const std::exception&) {
+            }
+        }
+    };
+
+    auto it = park_suspensions_.begin();
+    while (it != park_suspensions_.end()) {
+        if (it->second.has_wait &&
+            it->second.wait.owner_script.compare(0, 7, "system/") != 0)
+            break;
+        ++it;
+    }
+    if (it == park_suspensions_.end()) {
+        // A load has no suspended park (loading clears them): its save carries
+        // the story frame instead. Land there and wait for the reader.
+        if (!loaded_story_frame_valid_) return;
+        loaded_story_frame_valid_ = false;
+        std::vector<oa::runtime::CallFrame> cs = interpreter_->call_stack();
+        size_t keep = cs.size();
+        for (size_t i = 0; i < cs.size(); ++i) {
+            if (cs[i].script == loaded_story_script_ &&
+                cs[i].return_line == loaded_story_line_) {
+                keep = i;
+                break;
+            }
+        }
+        cs.resize(keep);
+        interpreter_->set_call_stack(std::move(cs));
+        (void)interpreter_->set_position(loaded_story_script_, loaded_story_line_);
+        oa::runtime::Wait w;
+        w.release = oa::runtime::Wait::OnClick;
+        w.wakes = oa::runtime::Wait::WakeClick;
+        arm_park(std::move(w), true);
+        run_return_tail();
+        save_ui_recovery_ = false;
+        return;
+    }
+
+    const uint64_t frame_id = it->first;
+    ParkSuspension s = std::move(it->second);
+    park_suspensions_.erase(it);
+    // Drop every frame the screen pushed on top of the one that opened it.
+    std::vector<oa::runtime::CallFrame> cs = interpreter_->call_stack();
+    for (size_t i = 0; i < cs.size(); ++i) {
+        if (cs[i].id == frame_id) {
+            cs.resize(i);
+            break;
+        }
+    }
+    interpreter_->set_call_stack(std::move(cs));
+    (void)interpreter_->set_position(s.wait.owner_script, s.wait.owner_line);
+    save_ui_recovery_ = false;
+    wait_ = std::move(s.wait);
+    wait_->armed_tick = tick_count_;
+    wait_->seq = ++wait_seq_;
+    wait_->auto_elapsed_ms = 0;
+    wait_->restored = true;
+    if (!s.tail.empty()) parked_tail_ = std::move(s.tail);
+    pending_parks_ = std::move(s.pending);
+    run_return_tail();
+}
+
 
 void GameRuntime::RuntimeState::force_pointer_drag(const std::string& layer_id) {
     if (layer_id.empty() || !interpreter_) return;

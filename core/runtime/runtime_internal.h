@@ -518,6 +518,27 @@ struct GameRuntime::RuntimeState {
     /// to (no park, or a bare [stop]) — the jump owns the execution then.
     bool suspend_park_on_jump(uint64_t frame_id);
     bool restore_park_from_frame(uint64_t frame_id);
+    /// The framework opens a UI screen by [call]ing system/ui.asb and closes it
+    /// by clearing adv.func; the script frames that screen opened do not always
+    /// unwind (ui_return jumps back into the UI script, whose [return] then
+    /// lands on a [stop] of its own). When the session is gone but a page park
+    /// is still suspended, roll back to it — otherwise the cursor stays on the
+    /// UI script with every press re-arming its [stop] (test13: save/load left
+    /// the story frozen on ui.asb).
+    void settle_ui_session_park();
+    bool ui_session_open();
+    /// Set by a completed save/load: for the next few hundred frames a UI
+    /// script wait with no live session is treated as a screen that failed to
+    /// unwind, and the page park is handed back. Normal screen open/close
+    /// never arms it, so the framework's own close path keeps its behaviour.
+    bool save_ui_recovery_ = false;
+    int save_ui_recovery_frames_ = 0;
+    /// Story frame a loaded save carried (the outermost non-system frame of
+    /// its call stack). A load restores the UI screen's position, so this is
+    /// the page the reader actually belongs to once that screen closes.
+    bool loaded_story_frame_valid_ = false;
+    std::string loaded_story_script_;
+    size_t loaded_story_line_ = 0;
     // [C] E: 宿主输入泵（边沿在每次 tick 后清）
     HostInput input_;
     // message-layer text domain lives in renderer_.text().

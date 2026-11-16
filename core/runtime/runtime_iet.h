@@ -561,6 +561,27 @@ public:
         }
         call_stack_ = std::move(stack);
     }
+    /// Put the cursor on a script row without touching the call stack or the
+    /// queue-wait flags. Used when a suspended park is handed back: the park
+    /// belongs to the page it was armed on, and closing the UI that took it
+    /// over has to put the reader back on that page — the stack has already
+    /// unwound to the frame that opened the UI.
+    bool set_position(const std::string& script, size_t line) {
+        if (script.empty()) return false;
+        if (!scripts_.count(script) && hooks_.file_loader) {
+            try {
+                load_external_script(script);
+            } catch (const std::exception&) {
+                return false;
+            }
+        }
+        const auto it = scripts_.find(script);
+        if (it == scripts_.end()) return false;
+        if (line > it->second.instructions.size()) return false;
+        current_script_name_ = script;
+        current_line_ = line;
+        return true;
+    }
     /// Temporarily detach / re-queue pending engine tags (used by the save
     /// domain to flush only the tags an onSave/onLoad handler generated).
     /// restore_tag_queue re-queues the taken items BEHIND whatever the flushed

@@ -274,6 +274,11 @@ void collect_text_snapshot(oa::runtime::SaveData* data, const oa::render::TextEn
     data->has_text = true;
     const std::string active = text.active_layer_id();
     for (const auto& [id, ml] : text.layers()) {
+        // A layer whose scene node is gone ([lydel]) must not come back as a
+        // phantom page after a load. text_hidden alone is the framework's
+        // [sceout] and DOES get saved: the story page is hidden while a UI
+        // screen is open, and that page is exactly what has to return.
+        if (ml.scene_gone) continue;
         std::string flat;
         for (const auto& u : ml.page) {
             if (u.kind == oa::render::PageUnit::Kind::Newline) flat.push_back('\n');
@@ -517,6 +522,12 @@ bool GameRuntime::RuntimeState::save_game_to(const std::string& file) {
                  data.current_line);
     // A numbered save refreshes the system save too.
     (void)syssave();
+    // The save screen closes through ui_return, which re-opens the screen and
+    // hands control back in the middle of the UI script. Give the runtime a
+    // window to put the reader back on the page once the screen is really
+    // gone (see settle_ui_session_park).
+    save_ui_recovery_ = true;
+    save_ui_recovery_frames_ = 900;
     return true;
 }
 
@@ -751,7 +762,6 @@ LoadResult GameRuntime::RuntimeState::load_game(const std::string& file, int64_t
     const size_t cleared = reset_ephemeral_on_load();
 
     const SceneRestoreStats rst = restore_scene_snapshot(&scene(), data);
-    restore_text_snapshot(&text(), &scene(), data);
     renderer_.request_repaint();
     for (const auto& [k, row] : live_input) {
         scene().restore_input_row(k.first, k.second, row);
@@ -812,6 +822,15 @@ LoadResult GameRuntime::RuntimeState::load_game(const std::string& file, int64_t
                      e.what());
     }
 
+    // The framework's own onLoad (`restore`) rebuilds the message window from
+    // the saved Lua tables — set_message_window2() resets the layers, so a text
+    // snapshot written before it would be wiped (test13: the loaded page had
+    // the cursor on it but the message window was empty). Apply the snapshot
+    // after the handler and its queued tags have run: the page the reader saw
+    // is the one that has to come back.
+    restore_text_snapshot(&text(), &scene(), data);
+    renderer_.request_repaint();
+
     if (data.has_audio) restore_audio_snapshot(&media_.audio_, data.audio);
     sync_system_audio_volumes();
 
@@ -835,6 +854,22 @@ LoadResult GameRuntime::RuntimeState::load_game(const std::string& file, int64_t
                      "[runtime] load: %zu malformed and %zu duplicate layer snapshot(s) "
                      "were skipped (explicit handling; no ghost nodes)\n",
                      rst.skipped_invalid, rst.skipped_dup);
+    }
+    // Same window as a save: the load screen unwinds through the UI script.
+    save_ui_recovery_ = true;
+    save_ui_recovery_frames_ = 900;
+    // The saved position is the UI screen's own (the save was taken from
+    // inside it); the outermost non-system call frame is the story page the
+    // reader has to land on when that screen closes.
+    loaded_story_frame_valid_ = false;
+    for (const auto& f : data.call_stack) {
+        if (f.first.compare(0, 7, "system/") != 0 &&
+            f.first.compare(0, 9, "scenario/") == 0) {
+            loaded_story_frame_valid_ = true;
+            loaded_story_script_ = f.first;
+            loaded_story_line_ = f.second;
+            break;
+        }
     }
     return LoadResult::Ok;
 }
