@@ -1296,11 +1296,19 @@ std::shared_ptr<MediaPlayers::Player::Prefetch> start_prefetch(
 
 } // namespace
 
-bool MediaPlayers::init()
+bool MediaPlayers::init(bool open_device)
 {
     // SDL3 audio output subsystem + device sink. Windowed hosts try the
     // default playback device; headless hosts never init SDL audio and run
     // the engine in silent mode (decode + completion events still run).
+    //
+    // 静音（--mute / 无头测试）就**不打开设备**：没有 sink，通道混音和影片
+    // 音频都无处可去，扬声器上不可能漏出声音。以前只是把主音量设成 0 ——
+    // 影片音频走自己的设备流、不经过通道混音器，所以视频的声音照样会响。
+    if (!open_device) {
+        sink_ = nullptr;
+        return true;
+    }
     if (!SDL_InitSubSystem(SDL_INIT_AUDIO)) {
         std::fprintf(stderr, "[app] SDL audio subsystem init failed: %s\n",
             SDL_GetError());

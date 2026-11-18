@@ -114,11 +114,11 @@ bool GameRuntime::RuntimeState::automode_sync_blocked() const {
     return false;
 }
 
-oa::runtime::InterpreterHooks::SoundInfoSnap
-GameRuntime::RuntimeState::sound_info_snapshot_for_hook() const {
+GameRuntime::RuntimeState::SoundSnap
+GameRuntime::RuntimeState::sound_info_snapshot() const {
     // get_sound_info: BGM + SE bus, sorted by id.
-    using Snap = oa::runtime::InterpreterHooks::SoundInfoSnap;
-    using Ch = oa::runtime::InterpreterHooks::SoundChannelSnap;
+    using Snap = SoundSnap;
+    using Ch = SoundSnap::Ch;
     Snap out;
     const auto& st = media_.audio_.state();
     const auto to_ch = [](const oa::media::SoundChannel& c) {

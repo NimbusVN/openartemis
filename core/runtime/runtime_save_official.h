@@ -110,7 +110,7 @@ bool official_key_is_host_path(const std::string& key);
 
 /// 官方 Pluto 文档的字节形状：u32 first(=1)、u32 ref(!=0)、u32 type(1..5)。
 /// 用来在导入时**先判断再转换**，免得把所有二进制变量都当 Pluto 试一遍。
-bool looks_like_official_pluto(const std::string& raw);
+bool looks_like_official_pluto(std::string_view raw);
 
 struct OfficialImportStats {
     size_t applied = 0;          ///< 实际写入的变量数

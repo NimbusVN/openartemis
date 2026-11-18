@@ -7,6 +7,8 @@
 
 namespace oa::runtime {
 
+class GameRuntime;
+
 /// Host boot settings (CLI parsing and platform policy stay in main.cpp).
 struct AppConfig {
     std::string project;               // .pfs archive or extracted project dir
@@ -47,6 +49,11 @@ public:
     void mouse_wheel(int direction);      // > 0 up, < 0 down
 
     AppResult tick();
+
+    /// 引擎本体（测试/调试用：读渲染队列、抓帧、注入状态）。
+    /// 事件仍应走 mouse_*/key_event —— 那才是 main.cpp 的同一条路径。
+    GameRuntime& runtime();
+    const GameRuntime& runtime() const;
 
 private:
     struct Impl;

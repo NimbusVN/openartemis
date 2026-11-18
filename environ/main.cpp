@@ -315,11 +315,14 @@ SDL_AppResult SDL_AppInit(void** appstate, int argc, char* argv[])
 
     SDL_SetHintWithPriority(SDL_HINT_MAIN_CALLBACK_RATE, "0", SDL_HINT_OVERRIDE);
     const bool headless = cfg.headless;
-    if (!headless) {
-        if (!SDL_Init(SDL_INIT_VIDEO)) {
+    if (!SDL_Init(SDL_INIT_VIDEO)) {
+        if (!headless) {
             std::fprintf(stderr, "SDL_Init failed: %s\n", SDL_GetError());
             return SDL_APP_FAILURE;
         }
+        std::fprintf(stderr, "[app] headless: SDL video unavailable (%s); "
+                             "running without a renderer\n", SDL_GetError());
+    } else {
         host->sdl_inited = true;
     }
     oa::plat::init();
@@ -337,6 +340,18 @@ SDL_AppResult SDL_AppInit(void** appstate, int argc, char* argv[])
     host->app = new oa::runtime::App(std::move(cfg));
     if (!host->app->boot()) return SDL_APP_FAILURE;
     if (headless) {
+        if (host->sdl_inited) {
+            host->window = SDL_CreateWindow(
+                "openartemis", host->app->stage_width(),
+                host->app->stage_height(), SDL_WINDOW_HIDDEN);
+            if (!host->window) {
+                std::fprintf(stderr, "[app] headless window failed: %s\n",
+                             SDL_GetError());
+            } else if (!host->app->attach_window(host->window)) {
+                std::fprintf(stderr, "[app] headless renderer failed: %s\n",
+                             SDL_GetError());
+            }
+        }
         const oa::runtime::AppResult r = host->app->run_headless();
         return r == oa::runtime::AppResult::Error ? SDL_APP_FAILURE
                                                   : SDL_APP_SUCCESS;

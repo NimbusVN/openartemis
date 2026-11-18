@@ -58,7 +58,6 @@ struct GameRuntime::RuntimeState {
         std::string savepath_ = "save";
         ScreenshotBuffer screenshot_;
         CaptureFn capture_fn_;
-        bool capture_pending_ = false;
         int autosave_allow_ = 0;
         bool autosaved_current_wait_ = false;
         uint64_t autosave_last_seq_ = 0;
@@ -67,8 +66,17 @@ struct GameRuntime::RuntimeState {
         oa::render::Compositor::QuadSizeFn hit_size_;
         oa::render::Compositor::AlphaSamplerFn alpha_sampler_;
         void* compositor_userdata_ = nullptr;
-        std::set<std::string> hovered_;
+        /// hover 集合：id → **该层实例代号**。
+        ///
+        /// 只记 id 是不够的：脚本的 `[lydel]`+`[lyc]` 会把同一个 id 的层
+        /// 整棵换掉（csvbtn 每次开界面都干）。旧实现按 id 记，于是新层被
+        /// 当成"已经 hover 着"，不再发 rollover；而它的 handler 是新的。
+        /// 玩家看到的就是"有时有反应、有时没反应"。
+        std::map<std::string, uint32_t> hovered_;
         std::string drag_layer_;
+        /// 拖拽目标的实例代号：层被重建 ⇒ 序列结束（不再往 Lua 送
+        /// drag/dragout，那些回调属于已经不存在的那个层）。
+        uint32_t drag_generation_ = 0;
         double drag_start_mouse_x_ = 0, drag_start_mouse_y_ = 0;
         double drag_origin_left_ = 0, drag_origin_top_ = 0;
         int mouse_prev_x_ = 0, mouse_prev_y_ = 0;
@@ -118,6 +126,10 @@ struct GameRuntime::RuntimeState {
         std::set<int> up_edges_;
         int mouse_x_ = 0, mouse_y_ = 0;
         bool decide_edge_ = false;
+        /// 本帧输入已被脚本吞掉（`e:overrideKey{status=0}` 不带 key）。
+        /// 每帧在 onEnterFrame 之前复位：vsync 是最外层的输入仲裁者，
+        /// 它说"这一帧没有输入"，引擎就不再拿原始事件去派发层/推剧情。
+        bool swallowed_frame_ = false;
     };
 
     // [C] H: 媒体/解码/emote 资源态；读档 reset_domains 清
@@ -162,9 +174,10 @@ struct GameRuntime::RuntimeState {
     size_t scene_layer_events() const { return renderer_.stats().layers; }
     size_t scene_tween_events() const { return renderer_.stats().tweens; }
     size_t tween_completion_calls() const { return renderer_.stats().tween_done; }
-    const oa::runtime::Wait* current_wait() const { return wait_ ? &*wait_ : nullptr; }
+    const oa::runtime::Wait* current_wait() const { return park_.wait ? &*park_.wait : nullptr; }
     uint64_t now_ms() const { return now_ms_; }
-    bool attach_window(void* native_window, const std::string& backend_kind);
+    bool attach_window(void* native_window, const std::string& backend_kind,
+                       bool with_audio = true);
     int stage_width() const { return rt_->project_.config.stage_width; }
     int stage_height() const { return rt_->project_.config.stage_height; }
     bool vsync_active() const { return renderer_.vsync_active(); }
@@ -186,7 +199,15 @@ struct GameRuntime::RuntimeState {
     void set_pointer_observer(std::function<void(const PointerDispatch&)> cb) {
         pointer_.pointer_observer_ = std::move(cb);
     }
-    const std::set<std::string>& hovered_layers() const { return pointer_.hovered_; }
+    /// 当前 hover 的层 id 集合（脚本查询用；实例代号不对外）。
+    std::set<std::string> hovered_layers() const {
+        std::set<std::string> out;
+        for (const auto& [id, gen] : pointer_.hovered_) {
+            (void)gen;
+            out.insert(id);
+        }
+        return out;
+    }
     bool is_hovered(const std::string& id) const { return pointer_.hovered_.count(id) > 0; }
     size_t pointer_dispatch_count() const { return pointer_.pointer_dispatch_count_; }
     void set_pointer_warp_callback(std::function<void(int, int)> cb) {
@@ -247,7 +268,11 @@ struct GameRuntime::RuntimeState {
     void force_pointer_drag(const std::string& layer_id);
     bool apply_text_event(const oa::runtime::Event& e);
     void enable_decode_pool(int threads = -1);
-    void post_frame_capture();
+    /// 同步抓一帧（存档缩略图）：直接读渲染器当前的 stage 内容。
+    void capture_screenshot();
+    const oa::render::RenderPlan* current_plan() const {
+        return &renderer_.render_plan();
+    }
     void sysload();
     bool syssave();
     bool save_game_to(const std::string& file);
@@ -306,6 +331,10 @@ struct GameRuntime::RuntimeState {
     void dispatch_control_events();
     /// Re-run the boot head with the Lua VM kept; full restart on failure.
     void reboot_boot_keep_vm(const char* reason);
+    /// 框架的 ReturnStack 落到引擎侧：收掉当前事件处理会话（会话帧 + 它上面
+    /// 的调用帧）。寄存器里的页面停驻由 frame_popped 沿途交还。
+    bool handler_session_return();
+
     /// Clear engine domains; does not touch the interpreter.
     void reset_domains();
     void handle_file_operation(const std::map<std::string, std::string>& params);
@@ -346,8 +375,21 @@ struct GameRuntime::RuntimeState {
     void dispatch_media_handler(const oa::media::VideoFinishHandler& h);
     void sync_system_audio_volumes();
     void set_bgm_loop_file(const std::string& file, bool loop_play);
-/// get_sound_info snapshot: BGM + SE bus.
-    oa::runtime::InterpreterHooks::SoundInfoSnap sound_info_snapshot_for_hook() const;
+    /// get_sound_info 的数据面：BGM + SE 总线（按 id 排序）。形状归宿主，
+    /// 解释器只负责把它写成 `name.playing/.gain/.pan` 这些变量。
+    struct SoundSnap {
+        struct Ch {
+            std::string id;
+            bool playing = false;
+            int64_t gain = 1000; // raw Artemis scale
+            int64_t pan = 0;
+        };
+        std::optional<Ch> bgm;
+        std::vector<Ch> se;
+    };
+    SoundSnap sound_info_snapshot() const;
+    /// 文本度量（宿主注入：字体替换时按测量结果等比缩放）。
+    std::function<std::tuple<double, double, double>()> text_metrics;
     /// Apply a scene event; true = consumed (never reaches the host stream).
     bool apply_scene_event(const oa::runtime::Event& e);
     /// Control/config rows and [lydrag]; runs after the scene domain.
@@ -372,7 +414,7 @@ struct GameRuntime::RuntimeState {
     void drop_pending_tween_cancels();
     /// Run until a park; map trans/video/alldelete/sync-tween waits.
     void run_until_wait();
-    /// Drain queued tags while parked; may replace or clear `wait_`.
+    /// Drain queued tags while parked; may replace or clear `park_.wait`.
     void drain_parked_queue();
     /// Hit test → hover diff → click/drag/push; reports claimed edges.
     struct PointerConsumption {
@@ -401,19 +443,6 @@ struct GameRuntime::RuntimeState {
     void notify_pointer(const PointerDispatch& d);
     /// config-tag application shared by apply_scene_event + tests.
     bool apply_control_config(const oa::runtime::Event& e);
-    /// Synthetic return frame for a parked input helper that queues tags
-    /// (single marker, never nested). Lifecycle: arm → settle → refresh.
-    struct InlineEventFrame {
-        std::string script;
-        size_t line = 0;
-        std::vector<oa::runtime::CallFrame> stack; // stack snapshot at push
-        bool claimed_by_jump = false;
-    };
-    void refresh_inline_event_frame();
-    void begin_inline_event_frame(bool force = false);
-    void settle_inline_event_frame(bool paused, bool has_queued, bool saw_call,
-                                   bool saw_jump);
-    bool inline_event_marker_active() const;
 
     // [B] H: 宿主注入的文件系统；读档保留
     std::shared_ptr<const oa::fs::IFileSystem> fs_;
@@ -429,28 +458,44 @@ struct GameRuntime::RuntimeState {
     std::string platform_;
     // [B] E+L: 宿主重建 VM（boot）；读档只 restore_position + Lua restore()
     std::unique_ptr<oa::runtime::Interpreter> interpreter_;
-    // [B] E: 读档后由恢复位置的那一行重跑重导出
-    std::optional<oa::runtime::Wait> wait_;
-    /// A park and the queued script tail enqueued *behind* it. The framework
-    /// queues a page's cleanup after its wait ([@] -> [calllua click_exit]);
-    /// that tail must not run while the wait is live (it clears the game's
-    /// adv.click gate) but must still run, in order, once the wait releases.
-    /// Newly enqueued handler tags (hover effects, button UI calls) keep
-    /// draining — the park only blocks the script's own tail.
+    /// 一个停驻（wait）和被它挡住的脚本尾巴。
+    ///
+    /// 框架会把一页的清理排在它的停驻之后（`[@]` → `[calllua click_exit]`）。
+    /// 那份尾巴不能停驻还活着的时候跑（它会清掉游戏的 adv.click 门），但停驻
+    /// 释放后必须按原顺序跑。处理函数新排的 tag（hover、按钮 UI 调用）不受影响。
     struct ParkedWait {
         oa::runtime::Wait wait;
         std::vector<oa::runtime::Instruction> tail;
     };
-    std::vector<oa::runtime::Instruction> parked_tail_; // tail behind wait_
-    // [C] E: 队列 tag 产生的停驻，必须等当前停驻结束后按 FIFO 武装
-    // （KAG pendings 的等价物；绝不能替换当前停驻）。
-    std::deque<ParkedWait> pending_parks_;
+    /// 一个**执行上下文**的停驻状态。
+    ///
+    /// 上下文按 `[call]` 嵌套，所以这三样东西天然是一个栈，而不是三份平行
+    /// 记账：`park_` 是当前层，`park_stack_` 是被 `[call]` 压住的外层（每层对应
+    /// 解释器调用栈里的一帧）。`[return]` 弹帧即恢复外层——宿主不再需要
+    /// "把停驻寄存到某个帧 id 上"再按 id 取回来。
+    struct ParkContext {
+        std::optional<oa::runtime::Wait> wait;
+        std::vector<oa::runtime::Instruction> tail; // 被 wait 挡住的脚本尾巴
+        // 队列 tag 产生的停驻：必须等本层停驻结束后按 FIFO 武装
+        //（KAG pendings 的等价物；绝不能替换当前停驻）。
+        std::deque<ParkedWait> pending;
+        // 队列排空时投递的命名 wake（[trigger name=]）
+        std::string pending_custom;
+        // [tweenset] 组内 sync=1 目标；组关闭时合成一个 Tween park
+        std::vector<std::string> pending_sync_tweens;
+    };
+    ParkContext park_;
+    std::vector<ParkContext> park_stack_;
+    /// 压帧：外层停驻入栈，当前层清空。
+    void push_park_context();
+    /// 弹帧：恢复外层停驻。返回恢复出来的那层是否有 wait（= 停驻被交还）。
+    bool pop_park_context();
+    void reset_park_contexts();
+    /// 处理函数把执行跳到别的脚本时，这一层有没有"值得回程"的页面停驻
+    /// （有 → 解释器压一层返回帧，流程自己的 [return] 落回这一页）。
+    bool park_wants_return_frame() const;
     void clear_pending_parks();
-    void prepend_live_tail(); // parked_tail_ -> front of the interpreter queue
-    // [C] E: [trigger name=] 在队列排空时投递的命名 wake
-    std::string pending_custom_;
-    // [C] E: [tweenset] 组内 sync=1 目标；组关闭时合成一个 Tween park
-    std::vector<std::string> pending_sync_tweens_;
+    void prepend_live_tail(); // park_.tail -> front of the interpreter queue
     // [C] E: 停驻身份自增；自动存档/探针用它，而不是可重复的语义签名
     uint64_t wait_seq_ = 0;
     // [C] E: 帧号（e:getFrameNumber）
@@ -500,45 +545,6 @@ struct GameRuntime::RuntimeState {
     std::deque<oa::runtime::Event> pending_events_;
     // [B] H: 宿主捕获钩子；读档保留
     std::function<void()> transition_capture_cb_;
-    // [B] E: 合成 CallFrame 标记（script/line/stack 快照）；读档 reset
-    std::optional<InlineEventFrame> inline_event_frame_;
-    /// A story/UI park suspended by a handler-issued [call] (frame id key).
-    /// The callee runs with a fresh execution state; popping the frame restores
-    /// the exact wait/pending/queue the caller was parked on.
-    struct ParkSuspension {
-        oa::runtime::Wait wait;
-        std::deque<ParkedWait> pending;
-        std::vector<oa::runtime::Instruction> tail;
-        bool has_wait = false;
-    };
-    std::map<uint64_t, ParkSuspension> park_suspensions_;
-    bool suspend_park_on_frame(uint64_t frame_id);
-    /// A queued (handler-issued) [jump] leaving the parked script: suspend the
-    /// page park on the jump's return frame. False = nothing worth returning
-    /// to (no park, or a bare [stop]) — the jump owns the execution then.
-    bool suspend_park_on_jump(uint64_t frame_id);
-    bool restore_park_from_frame(uint64_t frame_id);
-    /// The framework opens a UI screen by [call]ing system/ui.asb and closes it
-    /// by clearing adv.func; the script frames that screen opened do not always
-    /// unwind (ui_return jumps back into the UI script, whose [return] then
-    /// lands on a [stop] of its own). When the session is gone but a page park
-    /// is still suspended, roll back to it — otherwise the cursor stays on the
-    /// UI script with every press re-arming its [stop] (test13: save/load left
-    /// the story frozen on ui.asb).
-    void settle_ui_session_park();
-    bool ui_session_open();
-    /// Set by a completed save/load: for the next few hundred frames a UI
-    /// script wait with no live session is treated as a screen that failed to
-    /// unwind, and the page park is handed back. Normal screen open/close
-    /// never arms it, so the framework's own close path keeps its behaviour.
-    bool save_ui_recovery_ = false;
-    int save_ui_recovery_frames_ = 0;
-    /// Story frame a loaded save carried (the outermost non-system frame of
-    /// its call stack). A load restores the UI screen's position, so this is
-    /// the page the reader actually belongs to once that screen closes.
-    bool loaded_story_frame_valid_ = false;
-    std::string loaded_story_script_;
-    size_t loaded_story_line_ = 0;
     // [C] E: 宿主输入泵（边沿在每次 tick 后清）
     HostInput input_;
     // message-layer text domain lives in renderer_.text().

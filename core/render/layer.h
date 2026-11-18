@@ -12,6 +12,8 @@
 #include <string_view>
 #include <utility>
 
+#include "core/render/text.h"
+#include "core/render/text_state.h"
 #include "core/render/texture_key.h"
 #include <vector>
 
@@ -124,6 +126,13 @@ struct InputHandler {
 struct Layer {
     std::string id;                           // verbatim dotted id
     std::map<std::string, std::string> props; // verbatim Artemis params
+    /// 实例代号：节点每被创建/重建一次 +1。
+    ///
+    /// 脚本的 `[lydel]` + `[lyc]` 会把同一个 id 的层整棵换掉（csvbtn 每次
+    /// 开界面都这么干）。宿主侧凡是"记着某个层"的状态（hover、drag 起点、
+    /// 事件序列）都必须带上这个代号，否则新层会被当成旧层：hover 不重发
+    /// `rollover`、拖拽粘在已经不存在的目标上。
+    uint32_t generation = 0;
     // ---- 宿主内容（视频通道 / emote 画布）------------------------------
     // 源（视频引擎、emote 播放器）把整帧写进层；渲染只上传+绘制。
     // 纹理是层的派生缓存，不跨层持有状态 —— 任何一层/一次计划重建都不会
@@ -131,6 +140,13 @@ struct Layer {
     bool host_bound = false;                   // 绑定到宿主源（可能尚未出帧）
     std::shared_ptr<oa::render::HostTexture> texture; // 宿主内容纹理（源更新）
     int tex_w = 0, tex_h = 0;                  // 纹理像素尺寸（quad 用）
+    // ---- 文本内容 ---------------------------------------------------------
+    // 节点承载的文本（[chgmsg] 选中的那一页）。**和节点同生共死**：节点被
+    // [lydel] 删掉，文本就没有了 —— 不存在"藏起来等复活"的旧页。
+    //
+    // 会话级的排版配置（font / 绘制盒 / scetween）由 TextEngine 另存
+    // （TextProfile，按 id），节点重建时还回来；这里只放**内容**。
+    std::shared_ptr<oa::render::MessageLayer> text;
     // ---- typed parse results (only written when parsing succeeds) ----
     bool visible = true;                      // default true (is_visible)
     /// 节点被脚本【创建】（[lyc]/[lyc2]/csvbtn 行,经 Compositor::create;
@@ -284,9 +300,6 @@ struct SceneNode {
     /// 直接子节点,compare_ids 升序(前序 DFS == 全局 compare_ids 序);
     /// 非拥有(所有权在 Compositor)。
     std::vector<SceneNode*> children;
-    /// 引擎消息槽标记 —— layered=0 独立消息的槽节点(位于消息槽区
-    /// message_slots,不在场景 roots 树;渲染/顺序输出恒在场景区之后)。
-    bool message_slot = false;
 };
 
 /// [lytween] 完成回执：tween 完成处理器的公开**名字**（定义 = render 内部面
@@ -295,7 +308,7 @@ struct SceneNode {
 /// tests/transition_test.cpp）自行 include render_internal.h。
 struct TweenDone;
 
-class Compositor {
+class Compositor : public TextStore {
 public:
     /// 构造/析构外联（layer.cpp）：动画态经不透明 AnimStore 持有。
     /// unique_ptr 成员
@@ -320,6 +333,19 @@ public:
     /// Load-time reset: drop the whole layer tree plus tweens/anime/
     /// handler registries/message bindings and the "!" root props holder.
     void clear_scene();
+
+    // ---- TextStore（文本存在节点上；见 text.h）----------------------------
+    // 文本就是 Layer::text —— 节点删，文本随之没了。**没有**"隐藏起来等
+    // 复活"的第二份状态，也没有跨子系统的删除通知。
+    oa::render::MessageLayer* find_text(const std::string& id) override;
+    oa::render::MessageLayer& ensure_text(const std::string& id) override;
+    std::vector<std::string> text_ids() const override;
+    /// 节点实例代号（不存在 → 0）。宿主侧记 hover/drag 目标时用它判"还是
+    /// 不是同一个层"：id 会复用，代号不会。
+    uint32_t generation_of(const std::string& id) const {
+        const Layer* l = find(id);
+        return l ? l->generation : 0;
+    }
     /// Save-restore of one [lyevent] row (scene snapshots carry the
     /// layer event registrations; Layer.event_handlers is part of
     /// the serialized Scene). No-op when the layer does not exist.
@@ -380,10 +406,6 @@ public:
     /// 显式树根节点表(compare_ids 升序;只读)。渲染/诊断前序 DFS
     /// 入口:替代旧的 draw_order+前缀重建(每帧一次,免逐帧前缀扫描)。
     const std::vector<SceneNode*>& roots() const { return roots_; }
-    /// 引擎消息槽节点表(创建序;只读)。layered=0 独立消息的槽节点,
-    /// 恒在场景区之后绘制/输出(旧 message-last 排序垫底的显式化)。
-    /// 渲染 DFS 在遍历 roots 后再遍历本表。
-    const std::vector<SceneNode*>& message_slots() const { return message_slots_; }
     /// Back-to-front draw order: 场景区显式树前序 + 消息槽区创建序(每层
     /// 兄弟有序 ⇒ 场景区前序 == compare_ids sorted-roots DFS == 旧全局
     /// stable_sort 序;槽区不再参与 id 排序)。
@@ -425,35 +447,19 @@ public:
     // ensure_message_scene_node 槽位分配取代 id 侧编码)
     // ------------------------------------------------------------------
 
-    /// chgmsg 切换/创建消息层时登记 message_id → scene_id 绑定，使
-    /// [lyprop id="~xxx"] 解析到对应场景图层。
-    void set_message_layer_binding(const std::string& message_id,
-                                   const std::string& scene_id);
     /// 显式 chgmsg 重新选择消息层时脱离"随父删除失效"状态。
-    void revive_message_layer(const std::string& message_id);
     /// 默认消息层（[lyprop id="~"] 用；未设置时忽略该操作）。
     void set_default_message_layer(const std::optional<std::string>& message_id);
     /// 解析 layer 事件里的特殊 ID：`~xxx` → 绑定表映射（未登记按 xxx 直查）；
     /// `~` → 默认消息层（无默认返回 nullopt = 忽略）；其余原样返回。
     /// `!` 由调用方在此之前单独分派。
     std::optional<std::string> resolve_message_target(const std::string& raw) const;
-    /// 消息层当前绑定的场景目标（未登记返回消息层 id 自身；宿主文本摆位用）。
-    std::string bound_scene_id(const std::string& message_id) const;
-    /// 消息层当前是否有效可见（文本注入判定；宿主树规则，
-    /// 实现见 layer.cpp 的规则注释）：显式删除
-    /// 标记 ⇒ 不可见；绑定目标存在但不可有效可见 ⇒ 不可见；绑定目标是消息
-    /// 槽节点或目标缺失 ⇒ 消息 id 宿主树锚点活性；layered identity 且
-    /// 节点有效可见 ⇒ 可见。
-    bool is_message_layer_visible(const std::string& message_id) const;
     /// 消息层当前是否可绘制（渲染器文本注入判定；is_message_layer_visible
     bool is_message_layer_drawable(const std::string& message_id,
                                    bool text_positioned) const;
     /// 返回消息层的场景目标并确保节点存在（替代旧
     std::string ensure_message_scene_node(const std::string& message_id,
                                           bool layered);
-    /// id 是否引擎消息槽节点（槽区/结构判定，替代旧前缀字符串检查；
-    /// 序列化快照跳过槽、宿主诊断用）。
-    bool is_message_slot(const std::string& id) const;
 
     /// Host-side texture-size fallback for hit testing:
     /// layers without width/height or clip need their texture size. The
@@ -564,9 +570,6 @@ private:
     /// 建一个新空节点挂到 parent(或 roots_，parent==nullptr)，兄弟保持
     /// compare_ids 升序；节点入 nodes_（唯一所有权，存活期地址稳定）。
     SceneNode* make_node(SceneNode* parent, const std::string& id);
-    /// 分配一个引擎消息槽节点（单段诊断名 "@msg<n>"，不随消息 id
-    /// 变化；不进 roots_，按创建序进 message_slots_）。
-    SceneNode* make_message_slot();
     /// 从父（或 roots_）摘除 n；节点仍归 nodes_ 所有，由调用方 erase 释放。
     void detach_node(SceneNode* n);
     /// 子树（含自身）前序收集 id；remove 的级联清理（tween 桶 / 消息注册表）
@@ -574,12 +577,6 @@ private:
     void collect_subtree(const SceneNode* n, std::vector<std::string>* out) const;
     /// 前序追加（draw_order / 渲染 DFS）。
     void append_preorder(const SceneNode* n, std::vector<const Layer*>* out) const;
-    /// 宿主树锚点活性（is_message_layer_visible 内部辅助）：
-    /// 沿 message_id 祖先链取最近现存节点的有效可见性作为消息文本活性
-    /// （消息文本生命周期 = 宿主窗口树生命周期）；链上无任何现存
-    /// 节点时：多点消息 id ⇒ false（宿主树已死），单段消息 id（引擎自管
-    /// overlay，无宿主树概念）⇒ true。
-    bool host_tree_anchor_visible(const std::string& message_id) const;
     /// Drop tweens of the subtree (子树 id 集合) and cascade-remove every
     /// [tweenset] group touched by them across all layers.
     void apply_one_tween(const std::map<std::string, std::string>& params,
@@ -592,14 +589,6 @@ private:
     std::map<std::string, std::unique_ptr<SceneNode>> nodes_;
     // 无父节点（根），compare_ids 升序
     std::vector<SceneNode*> roots_;
-    // 引擎消息槽区 — layered=0 独立消息的槽节点（创建序;恒在场景区
-    // 之后绘制/输出;节点带 message_slot 标记,不进 roots_）。
-    std::vector<SceneNode*> message_slots_;
-    /// 消息 → 槽 id（独立于 message_layer_bindings_：绑定随宿主子树
-    /// 删除被清，槽是引擎资源，映射活到 clear_scene / 槽被
-    /// remove —— 保证宿主树删光后继续文本不反复建新槽）。
-    std::map<std::string, std::string> message_slot_of_;
-    uint64_t next_message_slot_serial_ = 0;
     // [lyprop id="!"] root-props holder (not a scene node; root_props)
     Layer root_props_;
     // 动画态（per-layer tween 桶 + [tweenset] 收集器 + [anime] 回放
@@ -611,10 +600,10 @@ private:
     // global input registry (input_handlers), keyed
     // (event_name, key)
     std::map<std::pair<std::string, std::string>, InputHandler> input_handlers_;
-    // message-layer binding registry + default + deleted markers
-    std::map<std::string, std::string> message_layer_bindings_;
+    /// 默认消息层（`[lyprop id="~"]` 的目标）。没有绑定表：消息 id 即节点 id。
     std::optional<std::string> default_message_layer_;
-    std::set<std::string> deleted_message_layers_;
+    /// 层实例代号分配器（make_node 每次 +1）。
+    uint32_t next_generation_ = 1;
     /// 层状态写计数(见 revision())。任何写路径都经 touch() 单点递增;
     /// 宿主供帧不经过它,故不失效帧计划。
     mutable uint64_t revision_ = 0;

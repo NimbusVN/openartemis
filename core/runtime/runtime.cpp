@@ -160,11 +160,12 @@ GameRuntime::RuntimeState::~RuntimeState()
 }
 
 bool GameRuntime::RuntimeState::attach_window(void* native_window,
-                                              const std::string& backend_kind)
+                                              const std::string& backend_kind,
+                                              bool with_audio)
 {
     if (!renderer_.create_renderer(native_window, backend_kind)) return false;
     oa::emote::emote_set_default_external_pose(true);
-    media_.media_players_->init();
+    media_.media_players_->init(with_audio);
     media_.video_.set_audio_output([mp = media_.media_players_.get()](const float* d, size_t n) {
         mp->push_video_audio(d, n);
     });
@@ -213,12 +214,77 @@ std::optional<std::vector<uint8_t>> GameRuntime::RuntimeState::read_save_file(
     return save_.save_store_->read(rel_path);
 }
 
+bool GameRuntime::has_text_metrics() const {
+    return s_ && static_cast<bool>(s_->text_metrics);
+}
+
 void GameRuntime::RuntimeState::bind_text_metrics(
     std::function<std::tuple<double, double, double>()> fn)
 {
-    if (!interpreter_ || !fn) return;
-    interpreter_->hooks().message_layer_metrics = std::move(fn);
+    if (!fn) return;
+    text_metrics = std::move(fn);
 }
+
+namespace {
+// e:var(system="file_update_time") 的日期渲染（yyyy/yy/MM/dd/hh/mm/ss，
+// 单字母不补零）。数据面归 runtime，解释器不再持有这张格式表。
+std::string format_update_time(const std::array<int64_t, 6>& c, const std::string& format) {
+    std::string out;
+    size_t i = 0;
+    const auto pad2 = [](int64_t v) {
+        char buf[4];
+        std::snprintf(buf, sizeof(buf), "%02lld", (long long)v);
+        return std::string(buf);
+    };
+    while (i < format.size()) {
+        const char ch = format[i];
+        size_t run = 1;
+        while (i + run < format.size() && format[i + run] == ch) ++run;
+        switch (ch) {
+            case 'y':
+                if (run >= 4) {
+                    char buf[8];
+                    std::snprintf(buf, sizeof(buf), "%04lld", (long long)c[0]);
+                    out += buf;
+                    i += run;
+                } else if (run >= 2) {
+                    out += pad2(c[0] % 100);
+                    i += run;
+                } else {
+                    out += ch;
+                    i += 1;
+                }
+                break;
+            case 'M':
+                out += (run >= 2) ? pad2(c[1]) : std::to_string(c[1]);
+                i += (run >= 2) ? run : 1;
+                break;
+            case 'd':
+                out += (run >= 2) ? pad2(c[2]) : std::to_string(c[2]);
+                i += (run >= 2) ? run : 1;
+                break;
+            case 'h':
+                out += (run >= 2) ? pad2(c[3]) : std::to_string(c[3]);
+                i += (run >= 2) ? run : 1;
+                break;
+            case 'm':
+                out += (run >= 2) ? pad2(c[4]) : std::to_string(c[4]);
+                i += (run >= 2) ? run : 1;
+                break;
+            case 's':
+                out += (run >= 2) ? pad2(c[5]) : std::to_string(c[5]);
+                i += (run >= 2) ? run : 1;
+                break;
+            default:
+                out += ch;
+                i += 1;
+                break;
+        }
+    }
+    return out;
+}
+
+} // namespace
 
 GameRuntime::GameRuntime(std::shared_ptr<const oa::fs::IFileSystem> fs)
     : s_(std::make_unique<RuntimeState>(this, std::move(fs))) {}
@@ -240,8 +306,9 @@ std::vector<oa::runtime::Event> GameRuntime::drain_events() { return s_->drain_e
 oa::runtime::Interpreter& GameRuntime::interpreter() { return s_->interpreter(); }
 const oa::runtime::Interpreter& GameRuntime::interpreter() const { return s_->interpreter(); }
 const std::shared_ptr<const oa::fs::IFileSystem>& GameRuntime::fs() const { return s_->fs(); }
-bool GameRuntime::attach_window(void* native_window, const std::string& renderer_kind) {
-    return s_->attach_window(native_window, renderer_kind);
+bool GameRuntime::attach_window(void* native_window, const std::string& renderer_kind,
+                                bool with_audio) {
+    return s_->attach_window(native_window, renderer_kind, with_audio);
 }
 std::string GameRuntime::resolve_magic_path(const std::string& name) const {
     return s_->resolve_magic_path(name);
@@ -330,8 +397,11 @@ size_t GameRuntime::media_handler_dispatches() const { return s_->media_handler_
 void GameRuntime::enable_decode_pool(int threads) { s_->enable_decode_pool(threads); }
 void GameRuntime::set_save_store(std::shared_ptr<oa::runtime::SaveStore> store) { s_->set_save_store(std::move(store)); }
 void GameRuntime::set_frame_capture(CaptureFn fn) { s_->set_frame_capture(std::move(fn)); }
-void GameRuntime::post_frame_capture() { s_->post_frame_capture(); }
 bool GameRuntime::syssave() { return s_->syssave(); }
+void GameRuntime::capture_screenshot() { s_->capture_screenshot(); }
+const oa::render::RenderPlan* GameRuntime::current_plan() const {
+    return s_->current_plan();
+}
 bool GameRuntime::save_game_to(const std::string& file) { return s_->save_game_to(file); }
 LoadResult GameRuntime::load_game(const std::string& file, int64_t trans_type) {
     return s_->load_game(file, trans_type);
@@ -432,25 +502,24 @@ void GameRuntime::RuntimeState::open_project(std::string_view platform) {
     // project-level seeding: savepath 与系统存档读取
     save_.savepath_ = sanitize_savepath(rt_->project_.config.savepath);
     interpreter_->set_variable("s.savepath", oa::runtime::Value::make_string(save_.savepath_));
-    interpreter_->hooks().frame_number = [this] { return tick_count_; };
-    // A handler-issued [call] takes the running context over. Park the live
-    // wait (and the parks queued behind it) on the new frame; the [return]
-    // that pops it restores the exact pre-call state. This is what makes a UI
-    // session (save/load/config/backlog) return to the *same story page*
-    // instead of running on past it.
-    interpreter_->hooks().queued_call_frame = [this](uint64_t frame_id) {
-        suspend_park_on_frame(frame_id);
+    // 帧号 / 存档根只在 LuaHost 上用（e:getFrameNumber、io.open 重定向），
+    // 直接写进去——不必先在 InterpreterHooks 上开一个洞再原样搬一次。
+    interpreter_->lua_bridge().host().frame_number = [this] { return tick_count_; };
+    // 框架 ReturnStack → e:tag{"return"}：会话立即收掉（原版 e:tag 语义）。
+    interpreter_->lua_bridge().host().handler_return = [this] {
+        return handler_session_return();
     };
-    // A handler-issued [jump] into another script is returnable the same way
-    // when it interrupts a page park (the framework's `[jump <flow>] ...
-    // [return]` idiom). The hook reports whether a park was suspended, i.e.
-    // whether the jump needs a return frame at all.
-    interpreter_->hooks().queued_jump_frame = [this](uint64_t frame_id) {
-        return suspend_park_on_jump(frame_id);
+    // 帧即执行上下文：解释器每压一层调用帧，外层停驻就入栈；弹帧时原样
+    // 交还。UI 会话（存档/读档/配置/backlog）因此总是回到**同一页**，而不是
+    // 顺着剧情往下跑。
+    interpreter_->hooks().frame_pushed = [this] { push_park_context(); };
+    // A handler-issued [jump] into another script is returnable when it
+    // interrupts a page park (the framework's `[jump <flow>] ... [return]`
+    // idiom). The hook answers whether the jump needs a return frame at all.
+    interpreter_->hooks().jump_needs_return_frame = [this] {
+        return park_wants_return_frame();
     };
-    interpreter_->hooks().frame_popped = [this](uint64_t frame_id) {
-        return restore_park_from_frame(frame_id);
-    };
+    interpreter_->hooks().frame_popped = [this] { return pop_park_context(); };
     interpreter_->hooks().exskip_jump_target = [this](const std::string& file) {
         if (!control_.exskip_active_ || control_.exskip_target_ < 0) return;
         if (control_.exskip_script_.empty()) control_.exskip_script_ = file;
@@ -471,41 +540,6 @@ void GameRuntime::RuntimeState::open_project(std::string_view platform) {
     interpreter_->hooks().file_loader = [this](const std::string& name)
         -> std::optional<std::vector<uint8_t>> {
         return fs_->read(interpreter_->resolve_magic_path(name));
-    };
-    // Slider readback: e:var system=get_layer_info dumps one scene
-    // layer's effective props (typed left/top/width/height/alpha/visible/
-    // clip + verbatim params; slider_dragX reads name.left after [lyprop]).
-    interpreter_->hooks().layer_info = [this](const std::string& id)
-        -> std::map<std::string, std::string> {
-        std::map<std::string, std::string> out;
-        const oa::render::Layer* l = scene().find(id);
-        if (!l) return out;
-        for (const auto& [k, v] : l->props) out[k] = v;
-        out["left"] = format_prop_num(l->left);
-        out["top"] = format_prop_num(l->top);
-        out["x"] = format_prop_num(l->left);
-        out["y"] = format_prop_num(l->top);
-        // Effective size: explicit width/height > clip > natural texture.
-        std::pair<double, double> natural = {0, 0};
-        if (l->width <= 0 && !l->has_clip) natural = bound_image_size(*l);
-        out["width"] = format_prop_num(l->width > 0
-                                           ? l->width
-                                           : (l->has_clip ? l->clip_w : natural.first));
-        out["height"] = format_prop_num(l->height > 0
-                                            ? l->height
-                                            : (l->has_clip ? l->clip_h : natural.second));
-        out["alpha"] = format_prop_num(l->alpha * 255.0);
-        out["visible"] = l->visible != 0.0 ? "1" : "0";
-        if (l->has_clip) {
-            out["clip"] = format_prop_num(l->clip_x) + "," + format_prop_num(l->clip_y) +
-                          "," + format_prop_num(l->clip_w) + "," +
-                          format_prop_num(l->clip_h);
-            out["clip_x"] = format_prop_num(l->clip_x);
-            out["clip_y"] = format_prop_num(l->clip_y);
-            out["clip_w"] = format_prop_num(l->clip_w);
-            out["clip_h"] = format_prop_num(l->clip_h);
-        }
-        return out;
     };
     // The decode host reads media assets through the same resolution:
     // the interpreter's magic-path table first, then the project filesystem.
@@ -549,44 +583,188 @@ void GameRuntime::RuntimeState::open_project(std::string_view platform) {
     interpreter_->hooks().resource_exists = [read_resolved](const std::string& resolved) {
         return read_resolved(resolved).has_value();
     };
-    interpreter_->hooks().immediate_tags = false;
-    // FPM's estag calls are fall-through label chains that enqueue the whole
-    // UI state; holding the queue behind them collapses the entrance into one
-    // burst (see InterpreterHooks::queue_call_hold). Non-FPM keeps the hold.
-    interpreter_->hooks().queue_call_hold = false;
-    interpreter_->hooks().save_root = [this]() -> std::string {
+    interpreter_->lua_bridge().host().save_root = [this]() -> std::string {
         if (auto dir = std::dynamic_pointer_cast<oa::runtime::DirSaveStore>(save_.save_store_)) {
             return dir->root();
         }
         return std::string();
     };
-    interpreter_->hooks().save_file_exists = [this](const std::string& file) -> bool {
-        const std::string rel = qualify_save_file(file);
-        if (rel.empty() || !save_.save_store_) return false;
-        return save_.save_store_->exists(rel);
-    };
-    interpreter_->hooks().file_mtime =
-        [this](const std::string& file)
-        -> std::optional<std::array<int64_t, 6>> {
-        const std::string rel = qualify_save_file(file);
-        if (rel.empty() || !save_.save_store_) return std::nullopt;
-        return save_.save_store_->modification_time(rel);
-    };
-    interpreter_->hooks().sound_info = [this] { return sound_info_snapshot_for_hook(); };
-    // e:var system=get_backlog_size/get_backlog_tags/get_message_tags
-    // host query hooks → oa::render::TextEngine data surface. The interpreter
-    // side of this bridge was previously unwired; here the runtime provides
-    // the real data.
-    interpreter_->hooks().backlog_size = [this]() -> size_t {
-        return text().backlog_size();
-    };
-    interpreter_->hooks().backlog_tags = [this](size_t page, bool allfont)
-        -> std::optional<std::vector<std::string>> {
-        return text().backlog_tags(page, allfont);
-    };
-    interpreter_->hooks().message_tags = [this](const std::string& id, bool allfont)
-        -> std::optional<std::vector<std::string>> {
-        return text().message_tags(id, allfont);
+    // e:var(system=...) 的宿主数据面：解释器只管把它们写进变量域，数据和
+    // 形状（name / name.size / name.N.*）都由这里给出。
+    interpreter_->hooks().system_var =
+        [this](const std::string& system, const std::string& name,
+               const std::map<std::string, std::string>& params)
+        -> std::optional<oa::runtime::InterpreterHooks::VarWrites> {
+        using Writes = oa::runtime::InterpreterHooks::VarWrites;
+        const auto arg = [&params](const char* k) {
+            const auto it = params.find(k);
+            return it == params.end() ? std::string() : it->second;
+        };
+        if (system == "get_layer_info") {
+            // 滑块回读（slider_dragX / xslider_pin）：把一层的有效属性摊成
+            // name.<prop>。先冲刷排队的文本标签，否则读到的是上一帧。
+            interpreter_->flush_pending_text_tags();
+            Writes out;
+            const std::string id = arg("id");
+            const oa::render::Layer* l = id.empty() ? nullptr : scene().find(id);
+            if (!l) return out;
+            std::map<std::string, std::string> props;
+            for (const auto& [k, v] : l->props) props[k] = v;
+            props["left"] = format_prop_num(l->left);
+            props["top"] = format_prop_num(l->top);
+            props["x"] = format_prop_num(l->left);
+            props["y"] = format_prop_num(l->top);
+            std::pair<double, double> natural = {0, 0};
+            if (l->width <= 0 && !l->has_clip) natural = bound_image_size(*l);
+            props["width"] = format_prop_num(
+                l->width > 0 ? l->width : (l->has_clip ? l->clip_w : natural.first));
+            props["height"] = format_prop_num(
+                l->height > 0 ? l->height : (l->has_clip ? l->clip_h : natural.second));
+            props["alpha"] = format_prop_num(l->alpha * 255.0);
+            props["visible"] = l->visible != 0.0 ? "1" : "0";
+            if (l->has_clip) {
+                props["clip"] = format_prop_num(l->clip_x) + "," + format_prop_num(l->clip_y) +
+                                "," + format_prop_num(l->clip_w) + "," +
+                                format_prop_num(l->clip_h);
+                props["clip_x"] = format_prop_num(l->clip_x);
+                props["clip_y"] = format_prop_num(l->clip_y);
+                props["clip_w"] = format_prop_num(l->clip_w);
+                props["clip_h"] = format_prop_num(l->clip_h);
+            }
+            for (const auto& [k, v] : props)
+                out.emplace_back(name + "." + k, oa::runtime::Value::make_string(v));
+            return out;
+        }
+        if (system == "get_backlog_size") {
+            Writes out;
+            out.emplace_back(name, oa::runtime::Value::make_int(
+                                       (long long)text().backlog_size()));
+            return out;
+        }
+        if (system == "get_backlog_tags") {
+            long long page = 0;
+            try {
+                page = std::stoll(arg("page"));
+            } catch (...) {
+                page = 0;
+            }
+            if (page < 0) page = 0;
+            const std::string allfont = arg("allfont");
+            const bool prefix = allfont == "1" || allfont == "true" || allfont == "on";
+            const auto tags = text().backlog_tags((size_t)page, prefix);
+            Writes out;
+            if (tags) {
+                for (size_t i = 0; i < tags->size(); ++i)
+                    out.emplace_back(name + "." + std::to_string(i),
+                                     oa::runtime::Value::make_string((*tags)[i]));
+                out.emplace_back(name + ".size",
+                                 oa::runtime::Value::make_int((long long)tags->size()));
+            } else {
+                out.emplace_back(name + ".size", oa::runtime::Value::make_int(0));
+            }
+            return out;
+        }
+        if (system == "get_message_tags") {
+            const std::string allfont = arg("allfont");
+            const bool prefix = allfont == "1" || allfont == "true" || allfont == "on";
+            const auto tags = text().message_tags(arg("id"), prefix);
+            Writes out;
+            if (tags) {
+                for (size_t i = 0; i < tags->size(); ++i)
+                    out.emplace_back(name + "." + std::to_string(i),
+                                     oa::runtime::Value::make_string((*tags)[i]));
+                out.emplace_back(name + ".size",
+                                 oa::runtime::Value::make_int((long long)tags->size()));
+            } else {
+                out.emplace_back(name + ".size", oa::runtime::Value::make_int(0));
+            }
+            return out;
+        }
+        if (system == "file_exist") {
+            // 只有 save=1 归宿主：保存区不是工程资源。工程内的存在性由
+            // 解释器自己按 PFS 探（它拿到这个返回值后继续走通用分支）。
+            if (arg("save") != "1") return std::nullopt;
+            const std::string rel = qualify_save_file(arg("file"));
+            const bool exists = !rel.empty() && save_.save_store_ &&
+                                save_.save_store_->exists(rel);
+            Writes out;
+            out.emplace_back(name, oa::runtime::Value::make_bool(exists));
+            return out;
+        }
+        if (system == "file_update_time") {
+            const std::string rel = qualify_save_file(arg("file"));
+            const std::string fmt_s = arg("format");
+            std::string value = arg("noexist");
+            if (!rel.empty() && save_.save_store_) {
+                if (auto c = save_.save_store_->modification_time(rel))
+                    value = format_update_time(*c, fmt_s.empty() ? "yyyy/MM/dd hh:mm:ss"
+                                                                 : fmt_s);
+            }
+            Writes out;
+            out.emplace_back(name, oa::runtime::Value::make_string(value));
+            return out;
+        }
+        if (system == "get_sound_info") {
+            Writes out;
+            const auto snap = sound_info_snapshot();
+            const std::string id = arg("id");
+            if (!id.empty()) {
+                const auto it = std::find_if(snap.se.begin(), snap.se.end(),
+                                             [&](const auto& c) { return c.id == id; });
+                if (it != snap.se.end()) {
+                    out.emplace_back(name + ".playing",
+                                     oa::runtime::Value::make_int(it->playing ? 1 : 0));
+                    out.emplace_back(name + ".gain",
+                                     oa::runtime::Value::make_int(it->gain));
+                    out.emplace_back(name + ".pan", oa::runtime::Value::make_int(it->pan));
+                } else {
+                    out.emplace_back(name + ".playing", oa::runtime::Value::make_int(0));
+                }
+                return out;
+            }
+            out.emplace_back(name + ".playing",
+                             oa::runtime::Value::make_int(
+                                 snap.bgm && snap.bgm->playing ? 1 : 0));
+            out.emplace_back(name + ".gain",
+                             oa::runtime::Value::make_int(snap.bgm ? snap.bgm->gain : 1000));
+            out.emplace_back(name + ".pan",
+                             oa::runtime::Value::make_int(snap.bgm ? snap.bgm->pan : 0));
+            size_t index = 0;
+            for (const auto& ch : snap.se) {
+                const std::string pfx = name + "." + std::to_string(index);
+                out.emplace_back(pfx + ".id", oa::runtime::Value::make_string(ch.id));
+                out.emplace_back(pfx + ".playing",
+                                 oa::runtime::Value::make_int(ch.playing ? 1 : 0));
+                out.emplace_back(pfx + ".gain", oa::runtime::Value::make_int(ch.gain));
+                out.emplace_back(pfx + ".pan", oa::runtime::Value::make_int(ch.pan));
+                ++index;
+            }
+            out.emplace_back(name + ".size",
+                             oa::runtime::Value::make_int((long long)snap.se.size()));
+            return out;
+        }
+        if (system == "get_message_layer_width" || system == "get_message_layer_height" ||
+            system == "get_message_layer_line_width") {
+            // Lua get_fontsize：先造一层、排测量文本，再读排版尺寸。读之前
+            // 必须把排队的文本标签落地，否则量到的是空层。
+            interpreter_->flush_pending_text_tags();
+            double width = 0, height = 0, line_width = 0;
+            if (text_metrics) {
+                const auto [w, h, lw] = text_metrics();
+                width = w;
+                height = h;
+                line_width = lw;
+            }
+            const double value = (system == "get_message_layer_width")
+                                     ? width
+                                     : (system == "get_message_layer_height") ? height
+                                                                              : line_width;
+            Writes out;
+            out.emplace_back(name,
+                             oa::runtime::Value::make_string(std::to_string(value)));
+            return out;
+        }
+        return std::nullopt; // 不是宿主数据 → 解释器走自己的通用分支
     };
     // Every interpreter event is routed by domain in one place; waits only
     // reach the host stream (and pause) through that dispatcher.
@@ -615,7 +793,7 @@ bool GameRuntime::RuntimeState::dispatch_engine_event(
 {
     if (e.tag == "trigger") {
         const auto it = e.params.find("name");
-        if (it != e.params.end() && !it->second.empty()) pending_custom_ = it->second;
+        if (it != e.params.end() && !it->second.empty()) park_.pending_custom = it->second;
         *out = oa::runtime::CallbackResult::Continue;
         return true;
     }
@@ -689,7 +867,7 @@ oa::runtime::CallbackResult GameRuntime::RuntimeState::host_event_result(
     // A closed [tweenset] carrying sync members is one Tween park for all of
     // them.
     if (e.kind == K::LayerEventCmd && e.tag == "/tweenset" &&
-        !pending_sync_tweens_.empty())
+        !park_.pending_sync_tweens.empty())
         return oa::runtime::CallbackResult::Pause;
     return oa::runtime::CallbackResult::Continue;
 }
@@ -716,16 +894,14 @@ void GameRuntime::RuntimeState::reset_domains() {
     transition().clear();
     pointer_.hovered_.clear();
     pointer_.drag_layer_.clear();
-    inline_event_frame_.reset();
-    park_suspensions_.clear();
+    reset_park_contexts();
     save_.screenshot_.valid = false;
-    save_.capture_pending_ = false;
     renderer_.stop_all_delete();
-    wait_.reset();
-    parked_tail_.clear();
-    pending_parks_.clear();
-    pending_custom_.clear();
-    pending_sync_tweens_.clear();
+    park_.wait.reset();
+    park_.tail.clear();
+    park_.pending.clear();
+    park_.pending_custom.clear();
+    park_.pending_sync_tweens.clear();
     save_.autosaved_current_wait_ = false;
     save_.autosave_last_seq_ = 0;
     exit_requested_ = false;
@@ -788,7 +964,6 @@ void GameRuntime::RuntimeState::finish_all_delete() {
     pointer_.hovered_.clear();
     pointer_.drag_layer_.clear();
     save_.screenshot_.valid = false;
-    save_.capture_pending_ = false;
     media_.emote_layers_.clear(); // static emote frames die with the scene
     media_.emote_view_cache_.clear(); // ... and so does a recorded view
 }
@@ -857,7 +1032,21 @@ void GameRuntime::RuntimeState::wire_lua_host() {
 
 void GameRuntime::RuntimeState::apply_override(int key, int status) {
     if (key < 0) {
-        // "all keys" semantic: not supported yet, ignore
+        // `e:overrideKey{status=0}`（不带 key）= **清空本帧输入**。
+        //
+        // 这是 vsync 系列唯一的"全局吞帧"手段：`scr.btstop`（按钮全停）、
+        // 按键检查、alt+enter 屏蔽、对话框/存读档页打开时都靠它把这一帧的
+        // 输入拦在引擎之外。以前这里是 "not supported yet, ignore" ——
+        // 于是脚本以为吞掉了，引擎照样把同一次按下派发给层 handler 和剧情
+        // 翻页，表现就是"点了一下既触发对话又推进了剧情 / 有时又什么都不
+        // 发生"（test2 的概率性）。
+        if (status == 0) {
+            input_state_.keys_down_.clear();
+            input_state_.down_edges_.clear();
+            input_state_.up_edges_.clear();
+            input_state_.overrides_.clear();
+            input_state_.swallowed_frame_ = true;
+        }
         return;
     }
     if (status == 0) {
@@ -876,12 +1065,8 @@ void GameRuntime::RuntimeState::tick(uint64_t delta_ms, const FrameInput& in) {
     // frame).
     transition().clear_finished(now_ms_);
     // Drop the inline-event marker once its frame left the stack.
-    refresh_inline_event_frame();
     // A closed UI screen may have left its own frames on the stack: hand the
     // page it was opened from back before input is resolved.
-    if (save_ui_recovery_frames_ > 0 && --save_ui_recovery_frames_ == 0)
-        save_ui_recovery_ = false;
-    settle_ui_session_park();
     // [alldelete]: the render fade clock expired -> clear the scene + text.
     if (renderer_.all_delete_expired(now_ms_)) finish_all_delete();
     // Cursor-warp emulation when the host cannot warp (hidden/headless).
@@ -909,13 +1094,27 @@ void GameRuntime::RuntimeState::tick(uint64_t delta_ms, const FrameInput& in) {
     for (const int k : in.key_down_edges) input_state_.down_edges_.insert(k);
     for (const int k : in.key_up_edges) input_state_.up_edges_.insert(k);
     if (in.left_click_edge) input_state_.down_edges_.insert(kKeyMouseLeft);
-    if (!in.left_down) input_state_.up_edges_.insert(kKeyMouseLeft);
+    // 鼠标左键的**抬起边沿**：只有"上一帧按着、这一帧松开"才算。
+    //
+    // 宿主（FrameInput）没有 left_up_edge 字段，最初这里写成"没按着就算抬起"，
+    // 于是 `e:isUpEdge(1)` 在每一帧都返回真。Lua 侧拿它当事件用的框架会被
+    // 骗：test13 的 vsync 用 `isUpTap()`（= `e:isUpEdge(1)`）判定"原地松手"，
+    // 恒真 ⇒ 光标刚悬停到存档槽、`save_over` 立起 `adv.longtap` 的下一帧就
+    // 被当成本次滑动的松手消费掉，槽位点击永远走不到 `save_check` ——
+    // 读档界面点哪个槽都没反应（"没法读档"）。
+    //
+    // 上一帧的按下态取自 pointer_.left_down_prev_：它在本函数之后的
+    // process_pointer_input 里才更新，此处读到的正是上一帧的值。
+    if (pointer_.left_down_prev_ && !in.left_down)
+        input_state_.up_edges_.insert(kKeyMouseLeft);
     // decide edge: override bit 32 freshly set this frame (scripted decide).
     // The snapshot is taken BEFORE the vsync hook so overrides injected by
     // Lua's onEnterFrame (the FPM dummy-click pattern: setexclick ->
     // e:overrideKey status=32) produce their decide edge in the SAME advance
     // (Lua runs inside the host frame before wait resolution).
     input_state_.prev_overrides_ = input_state_.overrides_;
+    // 每帧复位"输入被吞"：由本帧 vsync 的 overrideKey{status=0} 决定。
+    input_state_.swallowed_frame_ = false;
 
     // Lua per-frame hook first (it rewrites keys/decide edges, clears flags)
     interpreter_->fire_event("onEnterFrame");
@@ -925,7 +1124,18 @@ void GameRuntime::RuntimeState::tick(uint64_t delta_ms, const FrameInput& in) {
     input_state_.decide_edge_ = false;
     for (const auto& [key, bits] : input_state_.overrides_) {
         const int prev = input_state_.prev_overrides_.count(key) ? input_state_.prev_overrides_.at(key) : 0;
-        if ((bits & 32) && !(prev & 32)) input_state_.decide_edge_ = true;
+        if ((bits & 32) && !(prev & 32)) {
+            input_state_.decide_edge_ = true;
+            // 脚本合成的这一下按键也要进 push 注册表。
+            //
+            // 原版 `overrideKey{key=.., status=32}` = "此刻按下了这个键"：
+            // 存档/读档页的 `setonpush{key="146", exec="save_click"}` 就挂在
+            // 这条路上（vsync 在"原地松手"时合成 146，把槽位点击送到
+            // `save_click` → `save_check`）。以前只置 decide 位，push 行收不到
+            // ⇒ 点槽位后没人调 save_check，读档界面点哪个槽都没反应。
+            input_state_.down_edges_.insert(key);
+            input_state_.keys_down_.insert(key);
+        }
     }
 
     // Control-skip hold (role-14 keys) + effective-skip recompute —
@@ -940,11 +1150,11 @@ void GameRuntime::RuntimeState::tick(uint64_t delta_ms, const FrameInput& in) {
     // swallowed by a hide-mode click recovery) || legacy Enter/Space role-0
     // approximation || a keyconfig role-0 key edge.
     bool clicked;
-    if (in.left_click_edge) {
+    if (in.left_click_edge && !input_state_.swallowed_frame_) {
         // 等待点击的停驻不吃 push 映射：push 是键位转发，不是 UI 命中，
         // 不该吞掉推进剧情的那一下。Timed clickable waits ([wait input=1],
         // eqwait) count too — the opening logo uses exactly this shape.
-        const bool click_wait = wait_ && wait_->can(oa::runtime::Wait::OnClick);
+        const bool click_wait = park_.wait && park_.wait->can(oa::runtime::Wait::OnClick);
         const bool push_absorbs = pc.left_push_handled && !click_wait;
         clicked = !pc.input_swallowed && !pc.layer_handled && !pc.drag_handled &&
                   !push_absorbs;
@@ -957,8 +1167,8 @@ void GameRuntime::RuntimeState::tick(uint64_t delta_ms, const FrameInput& in) {
     // the story should go on, so a press on a menu page drawn over the story
     // reaches the page's buttons but not the wait under it. Queue parks keep
     // the press rules above.
-    if (advance_keys_set() && wait_ && wait_->waiting_click() &&
-        wait_->can(oa::runtime::Wait::OnDecide) && wait_->script_owned)
+    if (advance_keys_set() && park_.wait && park_.wait->waiting_click() &&
+        park_.wait->can(oa::runtime::Wait::OnDecide) && park_.wait->script_owned)
         clicked = false;
     clicked = clicked || pc.role_advance;
     // NB: only fresh PRESSES count — the host injects a mouse-left up-edge on
@@ -968,7 +1178,8 @@ void GameRuntime::RuntimeState::tick(uint64_t delta_ms, const FrameInput& in) {
     // 命中、游戏 setexclick 派生的 decide 边缘），它们同属一条命令，只能被
     // 消费一次。press_used_ 只延续一帧：把这次按下的 decide 余波吞掉。
     const bool press_edge =
-        in.left_click_edge || input_state_.down_edges_.count(kKeyEnter) > 0 ||
+        (in.left_click_edge && !input_state_.swallowed_frame_) ||
+        input_state_.down_edges_.count(kKeyEnter) > 0 ||
         input_state_.down_edges_.count(kKeySpace) > 0;
     if (press_edge) press_used_ = false;
     const bool used_before = press_used_;
@@ -993,9 +1204,9 @@ void GameRuntime::RuntimeState::tick(uint64_t delta_ms, const FrameInput& in) {
         for (;;) {
             const bool was_ff = control_.exskip_active_;
             bool attempted_resolve = false;
-            if (wait_) {
+            if (park_.wait) {
                 if (interpreter_->has_queued_tags()) drain_parked_queue();
-                if (wait_) {
+                if (park_.wait) {
                     attempted_resolve = true;
                     if (resolve_wait(delta_ms, click_cmd, decide_cmd)) {
                         if (press_live_) press_used_ = true;
@@ -1013,11 +1224,11 @@ void GameRuntime::RuntimeState::tick(uint64_t delta_ms, const FrameInput& in) {
             // The exskip burst keeps consuming parks while the
             if (!was_ff || !control_.exskip_active_) break;
             if (++burst >= kMaxExskipBurst) break;
-            if (attempted_resolve && wait_) break;
+            if (attempted_resolve && park_.wait) break;
         }
     }
 
-    pending_custom_.clear();
+    park_.pending_custom.clear();
 
     // Overrides are frame-local: a sticky decide bit 32 would swallow every
     // later click edge.
@@ -1040,7 +1251,7 @@ void GameRuntime::RuntimeState::arm_park(oa::runtime::Wait w, bool script_owned)
     w.auto_elapsed_ms = 0;
     w.se_deadline_ms = 0;
     // The line this park belongs to: a park is only meaningful while the script
-    // still sits on it (see restore_park_from_frame).
+    // still sits on it (see pop_park_context).
     if (const std::string* script = interpreter_ ? interpreter_->current_script() : nullptr) {
         w.owner_script = *script;
         w.owner_line = interpreter_->current_line();
@@ -1049,7 +1260,15 @@ void GameRuntime::RuntimeState::arm_park(oa::runtime::Wait w, bool script_owned)
         w.owner_line = 0;
     }
     normalize_wait(w);
-    wait_ = std::move(w);
+    if (std::getenv("OA_PARKDBG")) {
+        const std::string* cs = interpreter_ ? interpreter_->current_script() : nullptr;
+        std::fprintf(stderr, "[park] arm %s:%zu (now %s:%zu) stage=%d click=%d timed=%lld own=%d w=0x%x\n",
+                     w.owner_script.c_str(), w.owner_line,
+                     cs ? cs->c_str() : "-", interpreter_ ? interpreter_->current_line() : 0,
+                     int(w.stage), w.can(oa::runtime::Wait::OnClick) ? 1 : 0,
+                     (long long)w.timer_ms, w.script_owned ? 1 : 0, w.wakes);
+    }
+    park_.wait = std::move(w);
 }
 
 void GameRuntime::RuntimeState::normalize_wait(oa::runtime::Wait& w) {
@@ -1147,12 +1366,12 @@ std::optional<oa::runtime::Wait> GameRuntime::RuntimeState::park_from_event(
                 return w;
             }
         }
-        if (ev->tag == "/tweenset" && !pending_sync_tweens_.empty()) {
+        if (ev->tag == "/tweenset" && !park_.pending_sync_tweens.empty()) {
             W w;
             w.release = W::OnDecide | W::OnSkip;
             w.stage = W::Stage::Tween;
-            w.tween_ids = std::move(pending_sync_tweens_);
-            pending_sync_tweens_.clear();
+            w.tween_ids = std::move(park_.pending_sync_tweens);
+            park_.pending_sync_tweens.clear();
             return w;
         }
         return std::nullopt;
@@ -1185,16 +1404,16 @@ bool is_bare_stop(const oa::runtime::Wait& w) {
 void GameRuntime::RuntimeState::clear_pending_parks() {
     // Their tails hold already-enqueued script tags: put them back so nothing
     // is silently dropped when the queue parks are superseded.
-    for (auto& p : pending_parks_) {
+    for (auto& p : park_.pending) {
         interpreter_->prepend_tags(std::move(p.tail));
     }
-    pending_parks_.clear();
+    park_.pending.clear();
 }
 
 void GameRuntime::RuntimeState::prepend_live_tail() {
-    if (!parked_tail_.empty()) {
-        interpreter_->prepend_tags(std::move(parked_tail_));
-        parked_tail_.clear();
+    if (!park_.tail.empty()) {
+        interpreter_->prepend_tags(std::move(park_.tail));
+        park_.tail.clear();
     }
 }
 
@@ -1208,16 +1427,17 @@ void GameRuntime::RuntimeState::run_until_wait() {
             // The tags still queued behind this wait are the script's own
             // continuation (the page's click_exit cleanup): hold them until the
             // wait releases instead of running them under the live page.
-            if (from_queue) parked_tail_ = interpreter_->take_tag_queue();
+            if (from_queue) park_.tail = interpreter_->take_tag_queue();
             // A queued UI wait that arrived before this bare stop must take
             // over now, or its click wake can never be reached (the opening
             // logo's eqwait was exactly this shape).
-            if (wait_ && is_bare_stop(*wait_) && !pending_parks_.empty()) {
-                ParkedWait next = std::move(pending_parks_.front());
-                pending_parks_.pop_front();
-                arm_park(std::move(next.wait), false);
+            if (park_.wait && is_bare_stop(*park_.wait) && !park_.pending.empty()) {
+                ParkedWait next = std::move(park_.pending.front());
+                park_.pending.pop_front();
+                const bool next_owned = next.wait.script_owned;
+                arm_park(std::move(next.wait), next_owned);
                 prepend_live_tail();
-                parked_tail_ = std::move(next.tail);
+                park_.tail = std::move(next.tail);
             }
         }
     }
@@ -1230,17 +1450,8 @@ void GameRuntime::RuntimeState::drain_parked_queue() {
     if (!interpreter_) return;
     // A park never blocks user input: tags queued by pointer handlers (hover
     // feedback, the message-window buttons' UI calls) keep draining. Only the
-    // script's own tail queued behind the wait is held (parked_tail_) and runs
+    // script's own tail queued behind the wait is held (park_.tail) and runs
     // in order once the wait releases.
-    bool saw_call = false;
-    bool saw_jump = false;
-    bool paused = false;
-    auto settle = [&] {
-        saw_call |= interpreter_->queued_saw_call();
-        saw_jump |= interpreter_->queued_saw_jump();
-        settle_inline_event_frame(paused, interpreter_->has_queued_tags(), saw_call,
-                                  saw_jump);
-    };
     int guard = 0;
     while (interpreter_->has_queued_tags() && guard++ < 64) {
         const std::string* script_before = interpreter_->current_script();
@@ -1250,61 +1461,64 @@ void GameRuntime::RuntimeState::drain_parked_queue() {
         if (r == oa::runtime::ExecutionResult::ParkRestored) {
             // A [return] restored the caller's suspended park (wait + pending
             // parks + queue tail). Nothing in this drain may run behind it.
-            settle();
             return;
         }
         const bool moved = script_before != interpreter_->current_script() ||
                            line_before != interpreter_->current_line() ||
                            stack_before != interpreter_->call_stack().size();
         if (r == oa::runtime::ExecutionResult::Wait) {
-            paused = true;
             if (auto park = park_from_event(interpreter_->last_wait_event())) {
-                park->script_owned = false;
+                // 只有"队里那条 tag 自己"的停驻才是队列停驻。排空过程里被
+                // [call] 带进去的脚本行（UI 的 [stop]）仍属于脚本：释放时要
+                // 推进它，否则点一下只会在同一行重新停住（test13 关掉存档
+                // 界面后停在 ui.asb:1，怎么点都回不到正文）。
+                park->script_owned = !interpreter_->last_wait_from_queue();
                 ParkedWait next;
                 next.wait = std::move(*park);
                 if (interpreter_->last_wait_from_queue())
                     next.tail = interpreter_->take_tag_queue();
                 // A UI flow may take over a bare script stop (title/logo/menu
                 // parks). Story pacing parks (click/timed/reveal/keys) are
-                // protected: their waits go to pending_parks_ instead.
-                const bool stop_park = wait_ && is_bare_stop(*wait_);
-                if (wait_ && (!wait_->script_owned || stop_park)) {
+                // protected: their waits go to park_.pending instead.
+                const bool stop_park = park_.wait && is_bare_stop(*park_.wait);
+                const bool next_owned = next.wait.script_owned;
+                if (park_.wait && (!park_.wait->script_owned || stop_park)) {
                     // Same UI flow, or a bare stop handing over: latest-wins.
                     // The dropped parks' deferred tails still have to run; run
                     // them in enqueue order in front of the new park's tail.
                     std::vector<oa::runtime::Instruction> merged =
-                        std::move(parked_tail_);
-                    for (auto& p : pending_parks_) {
+                        std::move(park_.tail);
+                    for (auto& p : park_.pending) {
                         merged.insert(merged.end(), p.tail.begin(), p.tail.end());
                     }
                     merged.insert(merged.end(), next.tail.begin(), next.tail.end());
-                    pending_parks_.clear();
-                    arm_park(std::move(next.wait), false);
-                    parked_tail_ = std::move(merged);
+                    park_.pending.clear();
+                    arm_park(std::move(next.wait), next_owned);
+                    park_.tail = std::move(merged);
                 } else {
                     next.wait.seq = 0; // assigned by arm_park when it becomes current
-                    pending_parks_.push_back(std::move(next));
+                    park_.pending.push_back(std::move(next));
                 }
             }
-            settle();
             return; // the running park still governs
         }
         if (moved) {
             // A queued jump/return changed position: the UI flow takes over;
             // the dropped park's script tail still owes its cleanup tags.
-            wait_.reset();
-            interpreter_->prepend_tags(std::move(parked_tail_));
-            parked_tail_.clear();
+            park_.wait.reset();
+            interpreter_->prepend_tags(std::move(park_.tail));
+            park_.tail.clear();
             clear_pending_parks();
-            pending_custom_.clear();
-            pending_sync_tweens_.clear();
-            settle();
+            park_.pending_custom.clear();
+            park_.pending_sync_tweens.clear();
             return;
         }
-        saw_call |= interpreter_->queued_saw_call();
-        saw_jump |= interpreter_->queued_saw_jump();
     }
-    settle();
+}
+
+bool GameRuntime::RuntimeState::handler_session_return() {
+    if (!interpreter_) return false;
+    return interpreter_->handler_return_now();
 }
 
 void GameRuntime::RuntimeState::dispatch_pending_events() {
@@ -1368,12 +1582,9 @@ void GameRuntime::RuntimeState::ensure_active_message_node() {
     if (active.empty()) return;
     const oa::render::MessageLayer* al = text().layer(active);
     if (!al) return;
-    const bool is_layered = al->layered;
-    // 槽位显式化 —— layered=1 走宿主树节点;layered=0 走引擎消息槽
-    // (创建序,id 不随消息 id 变)。create/ensure 语义收在 Compositor 内。
-    const std::string scene_id = scene().ensure_message_scene_node(active, is_layered);
-    scene().set_message_layer_binding(active, scene_id);
-    scene().revive_message_layer(active);
+    // 文本宿主就是这一层自己（消息 id == 节点 id）。layered 只决定
+    // "文本是否跟着宿主树的显隐走"，不再有槽位/绑定表。
+    scene().ensure_message_scene_node(active, al->layered);
 }
 
 bool GameRuntime::RuntimeState::apply_text_event(const oa::runtime::Event& e) {
@@ -1426,10 +1637,8 @@ bool GameRuntime::RuntimeState::apply_text_event(const oa::runtime::Event& e) {
             // 槽位显式化 —— layered=0 独立消息分配引擎消息槽(创建序),
             // layered=1 走宿主树节点(ensure_path 物化,父链位姿语义不变:
             // glyph 落点=ml.left/top+排版偏移,经节点世界变换合成)。
-            const std::string scene_id = scene().ensure_message_scene_node(active, is_layered);
-            scene().set_message_layer_binding(active, scene_id);
-            scene().revive_message_layer(active);
-            scene().set_default_message_layer(active);
+            scene().ensure_message_scene_node(active, is_layered);
+                    scene().set_default_message_layer(active);
             // Publish s.current_message_layer for framework guards.
             if (interpreter_)
                 interpreter_->set_variable("s.current_message_layer",
@@ -1444,9 +1653,7 @@ bool GameRuntime::RuntimeState::apply_text_event(const oa::runtime::Event& e) {
                 const bool is_layered = al->layered;
                 const std::string scene_id =
                     scene().ensure_message_scene_node(active, is_layered);
-                scene().set_message_layer_binding(active, scene_id);
-                scene().revive_message_layer(active);
-            }
+                        }
             scene().set_default_message_layer(active);
             if (interpreter_)
                 interpreter_->set_variable("s.current_message_layer",
@@ -1593,8 +1800,9 @@ bool GameRuntime::RuntimeState::apply_scene_event(const oa::runtime::Event& e) {
         return true;
     }
     if (e.kind == K::LayerDelete) {
+        // 文本内容随节点一起结束（Compositor::remove 的删除通知接线，
+        // 见 RenderEngine::configure）；这里不再单独"隐藏"文本层。
         scene().remove(e.id);
-        text().hide_layer(e.id, true);
         renderer_.note(RNote::Layer);
         // a deleted layer (or subtree) releases its emote
         // player (fgdel/lydel2 flows) — players whose id equals the deleted
@@ -1651,9 +1859,9 @@ bool GameRuntime::RuntimeState::apply_scene_event(const oa::runtime::Event& e) {
                 if (const auto it = e.params.find("sync"); it != e.params.end())
                     sync = parse_i32(it->second, 0);
                 if (sync != 0 &&
-                    std::find(pending_sync_tweens_.begin(), pending_sync_tweens_.end(),
-                              e.id) == pending_sync_tweens_.end()) {
-                    pending_sync_tweens_.push_back(e.id);
+                    std::find(park_.pending_sync_tweens.begin(), park_.pending_sync_tweens.end(),
+                              e.id) == park_.pending_sync_tweens.end()) {
+                    park_.pending_sync_tweens.push_back(e.id);
                 }
             }
             return true;
@@ -1679,7 +1887,7 @@ bool GameRuntime::RuntimeState::apply_scene_event(const oa::runtime::Event& e) {
             return true;
         }
         if (e.tag == "tweenset") {
-            pending_sync_tweens_.clear();
+            park_.pending_sync_tweens.clear();
             scene().tweenset_start();
             renderer_.note(RNote::Tween);
             return true;
@@ -1790,18 +1998,18 @@ void GameRuntime::RuntimeState::dispatch_tween_done(
 }
 
 void GameRuntime::RuntimeState::flush_pending_tween_cancels() {
-    // Deferred [lytweendel] completions: deliver only while the layer
-    // survived this frame (same-frame cancels deliver; rebuilt/deleted
-    // layers end the round silently).
+    // Deferred [lytweendel] completions. 只要这个 id 的层还在，就把完成回调
+    // 交出去——**包括这一帧里被重建过的层**（`[lyc2]` 重新声明同一个 id 时
+    // 节点指针会变）。框架把 `[lytweendel]` 当"这一轮结束了"用：NekoMiko 的
+    // 配置页样本文字靠 `config_samplestart()` 先 del 再起一个新 tween 循环，
+    // 层被重建时把回调吞掉，样本文字就再也不出现（调完速度后"文字不再显示"）。
+    // 层真的没了（`[lydel]`）才静默丢弃：那时候回调写进去也没有落点。
     if (pending_tween_cancels_.empty()) return;
     std::vector<oa::render::TweenDone> out;
     for (auto& pc : pending_tween_cancels_) {
-        const oa::render::Layer* now = scene().find(pc.id);
-        if (now && now == pc.node) {
+        if (scene().find(pc.id)) {
             for (auto& d : pc.done) out.push_back(std::move(d));
         }
-        // else: layer deleted/rebuilt before the delivery point — the round
-        // simply ends silently (dropped).
     }
     pending_tween_cancels_.clear();
     dispatch_tween_done(out);
@@ -1815,7 +2023,9 @@ void GameRuntime::RuntimeState::drop_pending_tween_cancels() {
 // R6 order: text reveal → scene tweens/anime → emote clock → click-wait icon
 // → media frame end. Reordering changes animation phase.
 void GameRuntime::RuntimeState::advance_content_planes(uint64_t delta_ms) {
-    text().reveal_next(delta_ms);
+    // 逐字用绝对时钟（不是 delta 累加）：一帧卡多久都不会让文字永久落后，
+    // 改速度也只是换速率、从当前位置继续。
+    text().advance(now_ms_);
     advance_scene_frame();
     advance_emote_players(delta_ms); // host_clock layers only sync revisions
     advance_click_wait();
@@ -1888,7 +2098,7 @@ void GameRuntime::RuntimeState::transition_begin(const std::map<std::string, std
 }
 
 bool GameRuntime::RuntimeState::waiting_stop() const {
-    return wait_ && !wait_->can(oa::runtime::Wait::OnClick);
+    return park_.wait && !park_.wait->can(oa::runtime::Wait::OnClick);
 }
 
 // Debug-skip fast-forward: non-Stop waits release instantly; the
@@ -2039,8 +2249,8 @@ bool GameRuntime::RuntimeState::fire_click(oa::runtime::Wait& w, bool from_decid
 
 bool GameRuntime::RuntimeState::resolve_wait(uint64_t delta_ms, bool click_cmd,
                                              bool decide_cmd) {
-    if (!wait_) return true;
-    oa::runtime::Wait& w = *wait_;
+    if (!park_.wait) return true;
+    oa::runtime::Wait& w = *park_.wait;
     using W = oa::runtime::Wait;
     const bool armed_now = (w.armed_tick == tick_count_);
     // A park restored from a call frame re-enters on the tick that closed the
@@ -2113,12 +2323,12 @@ bool GameRuntime::RuntimeState::resolve_wait(uint64_t delta_ms, bool click_cmd,
         }
     }
     // [wait name=] / [trigger name=].
-    if (!pending_custom_.empty()) {
-        if (w.has(W::WakeCustom) && pending_custom_ == w.wake_id) {
-            pending_custom_.clear();
+    if (!park_.pending_custom.empty()) {
+        if (w.has(W::WakeCustom) && park_.pending_custom == w.wake_id) {
+            park_.pending_custom.clear();
             return true;
         }
-        pending_custom_.clear(); // no waiter for this trigger
+        park_.pending_custom.clear(); // no waiter for this trigger
     }
     // Presentation completion wakes (state-polled; the wait owns identity).
     switch (w.stage) {
@@ -2158,29 +2368,36 @@ void GameRuntime::RuntimeState::advance_wait() {
     // 活动层 == 当前剧情文本层——错层导致清页清错层、新文本叠旧页后且
     // reveal 冻结（NekoMiko 读档后"剧情推进但文字不动"）。
     // 在页面等待释放（一次翻页/一次 UI 交互的起点）时把活动层锚回内容层。
-    const bool page_wait_release = wait_ && wait_->waiting_click();
-    const bool script_owned = wait_ && wait_->script_owned;
-    const bool has_pending = !pending_parks_.empty();
-    wait_.reset();
+    const bool page_wait_release = park_.wait && park_.wait->waiting_click();
+    const bool script_owned = park_.wait && park_.wait->script_owned;
+    const bool has_pending = !park_.pending.empty();
+    park_.wait.reset();
     if (page_wait_release) text().anchor_active_to_content();
-    // The next wake may release the script line (an inline wait) or not (a
-    // queue wait: the cursor already points after its tag). Pending queue
-    // parks own the release themselves.
-    interpreter_->release_park(script_owned && !has_pending);
+    // 这一层是脚本自己的停驻 → 光标 +1；队列停驻（`script_owned=false`）的
+    // 光标已经指向它的 tag 之后，不用动。
+    //
+    // **不能因为 `has_pending` 就不加**：待定的队列停驻永远是 `script_owned=
+    // false`（arm_park(..., false)），它们自己永远不会补这一次 +1。以前这里
+    // 写的是 `script_owned && !has_pending`，于是"关掉 UI 后第一次点击"被
+    // 队尾的那个 uitrans 待定停驻花掉、剧情行不动，表现就是"文字没有刷新"
+    // （NekoMiko 进设置再回来：点多少下都停在同一行）。
+    // 先 +1 再让待定停驻接管是安全的：脚本仍被那个停驻挡住，下一行不会提前跑。
+    interpreter_->release_park(script_owned);
     // The held script tail belongs after this wait: run it before any tag that
     // arrived while the park was live.
     prepend_live_tail();
     if (has_pending) {
-        ParkedWait next = std::move(pending_parks_.front());
-        pending_parks_.pop_front();
-        arm_park(std::move(next.wait), false);
-        parked_tail_ = std::move(next.tail);
+        ParkedWait next = std::move(park_.pending.front());
+        park_.pending.pop_front();
+        const bool next_owned = next.wait.script_owned;
+        arm_park(std::move(next.wait), next_owned);
+        park_.tail = std::move(next.tail);
     }
 }
 
 // [glyph] click-wait icon: show/move while a click wait is fully revealed.
 void GameRuntime::RuntimeState::advance_click_wait() {
-    const bool click_wait = wait_ && wait_->waiting_click();
+    const bool click_wait = park_.wait && park_.wait->waiting_click();
     const bool show = click_wait && text().is_reveal_complete();
     if (!show) {
         if (!control_.active_wait_icon_.empty()) {
@@ -2229,6 +2446,9 @@ bool key_has_drag_handler(const oa::render::Compositor& scene, const std::string
 GameRuntime::RuntimeState::PointerConsumption GameRuntime::RuntimeState::process_pointer_input(const FrameInput& in) {
     PointerConsumption pc;
     if (!interpreter_) return pc;
+    // 脚本已经用 `e:overrideKey{status=0}` 吞掉本帧输入（vsync 的 btstop /
+    // 按键检查 / UI 打开）：这一帧不命中、不 hover、不派发。
+    if (input_state_.swallowed_frame_) return pc;
     const double mx = double(in.mouse_x);
     const double my = double(in.mouse_y);
     const bool left_down_edge = in.left_click_edge;
@@ -2258,72 +2478,119 @@ GameRuntime::RuntimeState::PointerConsumption GameRuntime::RuntimeState::process
         if (scene().has_any_enabled_handler(id)) interactive.push_back(id);
 
     // event_dispatch_layers: top + penetration, reversed.
+    //
+    // "顶层"取**带有这个事件处理行的第一层**，不是命中列表的第一层。
+    // 反例（test13）：存档/读档界面的槽位上盖着一层 alpha=0 的拖拽缩略图
+    // `500.99.N`（只有 drag/dragout），按钮本体 `500.10.N.0` 才有
+    // rollover/click。按命中列表取第一层的话，按钮的 rollover / click 全被
+    // 这层挡掉（它没声明 penetration），于是 `btn_cursor` 恒为 nil —— 槽位
+    // 既不高亮也点不动，读档界面点哪个槽都没反应（"没法读档"）。
+    // 没有该事件处理行的层本来就不参与这个事件的派发，不该占"顶层"的名额。
     auto dispatch_list = [&](const std::vector<std::string>& base,
                              const std::string& event_type) -> std::vector<std::string> {
         std::vector<std::string> out;
-        for (size_t i = 0; i < base.size(); ++i) {
-            const auto* h = scene().find_event_handler(base[i], event_type);
-            if (h && h->enabled && (i == 0 || h->penetration)) out.push_back(base[i]);
+        bool have_top = false;
+        for (const std::string& id : base) {
+            const auto* h = scene().find_event_handler(id, event_type);
+            if (!h || !h->enabled) continue;
+            if (!have_top) {
+                out.push_back(id);
+                have_top = true;
+            } else if (h->penetration) {
+                out.push_back(id);
+            }
         }
         std::reverse(out.begin(), out.end());
         return out;
     };
 
-    // Hover is rect-based; the diff runs only on pointer motion.
-    // Details: docs/RUNTIME_NOTES.md.
-    std::set<std::string> prev_hovered = pointer_.hovered_;
+    // --- hover：按**层实例**记账，不按 id -------------------------------
+    //
+    // 脚本的 `[lydel]`+`[lyc]` 会把同一个 id 的层整棵换掉（csvbtn 每次开
+    // 界面都这么干）。按 id 记 hover 的话，新层一出生就被当成"已经
+    // hover 着"，`rollover` 永远不重发；它的 handler 却是新的。玩家看到的
+    // 就是"有时有反应、有时没反应"。带上实例代号，重建 = 新对象 = 该重新
+    // 进一次。
     if (pointer_moved) {
-    std::set<std::string> hit_ids(hits.begin(), hits.end());
-    const auto hover_list = dispatch_list(interactive, "rollover");
-    std::set<std::string> new_hovered(hover_list.begin(), hover_list.end());
-    std::set<std::string> next = pointer_.hovered_;
-    // (a) rollouts: hovered layers that left the pointer rect / disappeared
-    std::vector<std::string> old_only;
-    for (const std::string& id : pointer_.hovered_) {
-        if (new_hovered.count(id)) continue;
-        const oa::render::Layer* l = scene().find(id);
-        const bool still_visible =
-            l && l->visible && scene().is_effectively_visible(id);
-        if (hit_ids.count(id) && still_visible) continue; // retained
-        old_only.push_back(id);
-        next.erase(id);
-    }
-    std::sort(old_only.begin(), old_only.end());
-    for (const std::string& old : old_only) {
-        const auto* row = scene().find_event_handler(old, "rollout");
-        if (row) dispatch_layer_row(old, *row, "rollout", {},
-                                    PointerDispatch::Kind::HoverOut);
-    }
-    // (b) overs: topmost-first layers not hovered yet
-    for (const std::string& id : hover_list) { // bottom -> top
-        if (pointer_.hovered_.count(id)) continue;
-        const auto* row = scene().find_event_handler(id, "rollover");
-        if (!row) continue;
-        dispatch_layer_row(id, *row, "rollover", {}, PointerDispatch::Kind::HoverIn);
-        next.insert(id);
-    }
-    prev_hovered = pointer_.hovered_;
-    pointer_.hovered_ = std::move(next);
+        const auto hover_list = dispatch_list(interactive, "rollover");
+        std::map<std::string, uint32_t> next;
+        // (a) 仍在指针下的层：代号没变才算留任，否则按"新层"重发 over
+        for (const std::string& id : hover_list) { // bottom -> top
+            const uint32_t gen = scene().generation_of(id);
+            const auto it = pointer_.hovered_.find(id);
+            if (it != pointer_.hovered_.end() && it->second == gen) {
+                next[id] = gen;
+                continue;
+            }
+            const auto* row = scene().find_event_handler(id, "rollover");
+            if (row) {
+                dispatch_layer_row(id, *row, "rollover", {},
+                                   PointerDispatch::Kind::HoverIn);
+            }
+            next[id] = gen;
+        }
+        // (b) 离开指针（含被重建掉的旧实例）：发 rollout
+        //
+        // "离开"的判据是**指针离开这一层的矩形**，不是"这层不再是最顶层"。
+        // 反例就是消息窗底部的 dock 触发条：`1.80.mw.-1` 是一整条透明热区，
+        // dock 展开后按钮正好盖在它上面。指针从热区移到按钮上时，按钮成了
+        // topmost，热区若按"不再最顶层"判就立刻收到 rollout → 关 dock →
+        // 指针又落回热区 → 再开……每帧一次，玩家看到的就是菜单栏一闪一闪
+        // 地躲开。它明明还在 hits 里（指针确实在矩形内、也没被 alpha 判成
+        // 透明），就不该算离开；rollout 留到真正移出矩形的那一帧。
+        std::vector<std::string> leave;
+        for (const auto& [id, gen] : pointer_.hovered_) {
+            if (next.count(id)) continue;
+            const bool still_under_pointer =
+                std::find(hits.begin(), hits.end(), id) != hits.end();
+            const auto* row = scene().find_event_handler(id, "rollover");
+            if (still_under_pointer && row && row->enabled &&
+                scene().generation_of(id) == gen) {
+                next[id] = gen; // 被上层盖住但指针没离开：保持 hover
+                continue;
+            }
+            leave.push_back(id);
+        }
+        std::sort(leave.begin(), leave.end());
+        for (const std::string& id : leave) {
+            const auto* row = scene().find_event_handler(id, "rollout");
+            if (!row) continue;
+            // 旧实例已经没了：仍然通知脚本"指针离开了"，但事件行按当前
+            // 节点取（脚本用它复位按钮态）。
+            dispatch_layer_row(id, *row, "rollout", {},
+                               PointerDispatch::Kind::HoverOut);
+        }
+        pointer_.hovered_ = std::move(next);
     } else {
-        // still pointer: no script events; silently forget vanished layers
-        // (their rollout fires on a later move if the script still cares).
-        bool changed = false;
+        // 指针没动：节点被删/重建也要掉出 hover。代号比较是唯一判据 ——
+        // "id 还在"说明不了什么（同 id 可能是新层）。
         for (auto it = pointer_.hovered_.begin(); it != pointer_.hovered_.end();) {
-            if (!scene().find(*it)) {
+            if (scene().generation_of(it->first) != it->second) {
                 it = pointer_.hovered_.erase(it);
-                changed = true;
             } else {
                 ++it;
             }
         }
-        (void)changed;
     }
     // --- click + drag start  ------------------------------
+    //
     if (left_down_edge) {
         const std::string top_hover = interactive.empty() ? std::string() : interactive.front();
         if (!top_hover.empty() && scene().is_layer_draggable(top_hover) &&
             key_has_drag_handler(scene(), top_hover)) {
             pc.drag_handled = drag_begin(top_hover, false);
+            if (pc.drag_handled) {
+                // 按下这一拍就要派发一次 `drag`（位移 0）。原版在"开始拖动"
+                // 的当拍就进 drag 回调：读档界面的槽位缩略图靠这一拍把
+                // `adv.fakeclick` 立起来，松手时 vsync 的 `isUpTap()` 才能用
+                // `e:overrideKey{key=146}` 合成"确定"，走到 `save_click` →
+                // `save_check`。只在移动时派发的话，原地点击永远不触发
+                // 槽位的 drag 回调，点哪个槽都没反应（test13 读档）。
+                if (const auto* row = scene().find_event_handler(top_hover, "drag"))
+                    dispatch_layer_row(top_hover, *row, "drag",
+                                       {{"drag", "1"}, {"id", top_hover}},
+                                       PointerDispatch::Kind::DragMove);
+            }
         }
         if (!pc.drag_handled) {
             for (const std::string& id : dispatch_list(interactive, "click")) {
@@ -2335,12 +2602,21 @@ GameRuntime::RuntimeState::PointerConsumption GameRuntime::RuntimeState::process
         }
     }
     if (in.left_down && pointer_moved && !pointer_.drag_layer_.empty()) {
-        drag_update(mx, my);
-        pc.drag_handled = true;
+        // 目标层被重建/删除 ⇒ 这条拖拽到此为止（不再把 drag 送进旧回调）。
+        if (scene().generation_of(pointer_.drag_layer_) != pointer_.drag_generation_) {
+            pointer_.drag_layer_.clear();
+            pc.drag_handled = true;
+        } else {
+            drag_update(mx, my);
+            pc.drag_handled = true;
+        }
     }
     if (left_up_edge) {
         if (!pointer_.drag_layer_.empty()) {
-            drag_end();
+            if (scene().generation_of(pointer_.drag_layer_) == pointer_.drag_generation_)
+                drag_end();
+            else
+                pointer_.drag_layer_.clear();
             pc.drag_handled = true;
         }
     }
@@ -2356,7 +2632,7 @@ GameRuntime::RuntimeState::PointerConsumption GameRuntime::RuntimeState::process
         if (key == kKeyMouseRight || key == 27) {
             if (trigger_rclick()) continue;
             // Cancel key satisfies a queue-armed [exkey] click park.
-            cancel_park = wait_ && wait_->waiting_click() && interpreter_ &&
+            cancel_park = park_.wait && park_.wait->waiting_click() && interpreter_ &&
                           interpreter_->last_wait_from_queue();
         }
         // keyconfig role edges (advance/hide/backlog/automode/skip).
@@ -2406,6 +2682,11 @@ bool GameRuntime::RuntimeState::dispatch_layer_row(
     const auto fn_it = params.find("function");
     bool handled = true;
     bool fn_queued = false; // this row's fn enqueued >=1 engine tag
+    // 事件处理会话：处理函数运行期间栈顶就是这层合成帧（对外 file==""），
+    // 框架的 ReturnStack() 才看得到它并立即收掉。ReturnStack 收过之后
+    // in_handler_frame() 已是 false，下面的收尾自然空转。
+    const bool session = fn_it != params.end() && !fn_it->second.empty() &&
+                         interpreter_->begin_handler_frame();
     // handler="var": apply the row's [var name data] assignment (iMel buttons).
     if (row.handler == "var") {
         const auto name_it = params.find("name");
@@ -2440,22 +2721,17 @@ bool GameRuntime::RuntimeState::dispatch_layer_row(
         fn_queued = interpreter_->queued_tag_count() > q0;
         notify_pointer(d);
     }
+    if (session) interpreter_->end_handler_frame();
     // Queue navigation after the handler; call pushes a return frame.
     if (!row.file.empty() || !row.label.empty()) {
-        // Protect the caller chain for this click's tag drain (see
-        // Interpreter::set_return_floor).
-        interpreter_->set_return_floor(interpreter_->call_stack().size());
         std::map<std::string, std::string> nav;
         if (!row.file.empty()) nav["file"] = row.file;
         if (!row.label.empty()) nav["label"] = row.label;
         interpreter_->enqueue_tag(row.call ? "call" : "jump", std::move(nav));
         handled = true;
     }
-    // Arm the inline marker only when THIS row enqueued tags.
-    if (fn_it != params.end() && !fn_it->second.empty() && row.file.empty() &&
-        row.label.empty() && fn_queued) {
-        begin_inline_event_frame(true);
-    }
+    // 处理帧的生命周期：处理函数没排队任何 tag = 这一帧已经结束，立即回收；
+    // 排了 tag 就留着，等队列排空时由 settle 收尾（[return] 也可能自己弹掉它）。
     return handled;
 }
 
@@ -2471,6 +2747,8 @@ bool GameRuntime::RuntimeState::dispatch_input_row(
     const auto fn_it = params.find("function");
     bool handled = true;
     bool fn_queued = false; // this row's fn enqueued >=1 engine tag
+    const bool session = fn_it != params.end() && !fn_it->second.empty() &&
+                         interpreter_->begin_handler_frame();
     if (fn_it != params.end() && !fn_it->second.empty()) {
         PointerDispatch d;
         d.kind = kind;
@@ -2489,6 +2767,7 @@ bool GameRuntime::RuntimeState::dispatch_input_row(
         fn_queued = interpreter_->queued_tag_count() > q0;
         notify_pointer(d);
     }
+    if (session) interpreter_->end_handler_frame();
     // file/label rows: enqueue jump/call — same path as layer rows.
     if (!row.file.empty() || !row.label.empty()) {
         std::map<std::string, std::string> nav;
@@ -2497,312 +2776,76 @@ bool GameRuntime::RuntimeState::dispatch_input_row(
         interpreter_->enqueue_tag(row.call ? "call" : "jump", std::move(nav));
         handled = true;
     }
-    if (fn_it != params.end() && !fn_it->second.empty() && row.file.empty() &&
-        row.label.empty() && fn_queued) {
-        begin_inline_event_frame(true);
-    }
     return handled;
 }
 
 // ---------------------------------------------------------------------------
-// inline-event return frames (begin /
-// helpers / settle): see runtime.h decl.
+// 停驻上下文（帧即执行上下文）
+//
+// 停驻不是宿主的一个单值成员，而是**当前这一层**的状态：`[call]` 压帧时
+// 外层连同它的尾巴、排队中的停驻、命名 wake 一起入栈；`[return]` 弹帧时
+// 原样交还。宿主因此不需要"把停驻寄存到某个帧 id"这种旁路记账。
 // ---------------------------------------------------------------------------
 
-bool GameRuntime::RuntimeState::inline_event_marker_active() const {
-    if (!inline_event_frame_ || !interpreter_) return false;
-    const auto& cs = interpreter_->call_stack();
-    const size_t idx = inline_event_frame_->stack.size();
-    if (idx >= cs.size()) return false;
-    return cs[idx].script == inline_event_frame_->script &&
-           cs[idx].return_line == inline_event_frame_->line;
+bool GameRuntime::RuntimeState::park_wants_return_frame() const {
+    // 只有"玩家正在读的那一页"的点击停驻值得回程：处理函数把执行跳到别的
+    // 脚本时，那段流程自己的 [return] 必须落回这一页（含它的停驻和排在后面的
+    // 脚本尾巴），而不是把调用链弹掉（test13: 快速存档/读档曾在返回路上翻页）。
+    //
+    // [stop] 或计时停驻不属于这一页（UI 界面/菜单早已结束），那条路由流程自己
+    // 拥有——它们的 ReturnStack()/[return] 编舞不能再多一层帧（backlog 的关闭
+    // 路径正是这样）。
+    return park_.wait && park_.wait->waiting_click();
 }
 
-void GameRuntime::RuntimeState::refresh_inline_event_frame() {
-    if (!inline_event_frame_) return;
-    if (!inline_event_marker_active()) {
-        inline_event_frame_.reset();
-    }
+void GameRuntime::RuntimeState::push_park_context() {
+    park_stack_.push_back(std::move(park_));
+    park_ = ParkContext{};
 }
 
-void GameRuntime::RuntimeState::begin_inline_event_frame(bool force) {
-    if (!interpreter_) return;
-    refresh_inline_event_frame();
-    // Single marker: never arm on top of a live one.
-    if (inline_event_frame_) {
-        // Reclaim a zombie select-park marker before arming a new one.
-        bool dropped = false;
-        if (inline_event_frame_->claimed_by_jump) {
-            const InlineEventFrame rec = *inline_event_frame_;
-            const std::string* cur = interpreter_->current_script();
-            const bool rec_is_select_park =
-                rec.script == "system/script.asb" && rec.line <= 1;
-            const bool at_same_park =
-                cur && *cur == rec.script &&
-                interpreter_->current_line() == rec.line;
-            // 可插入事件标记的停驻：脚本停驻、点击停驻、只受跳过控制的计时。
-            const bool anchor_park = !wait_ || wait_->is_input_anchor();
-            const auto& cs = interpreter_->call_stack();
-            // nothing above the marker frame: no helper chain in flight
-            // (note: the queue always holds THIS handler's fresh tags —
-            // begin runs after fn_queued — so queue state is no signal)
-            const bool nothing_above =
-                cs.size() == rec.stack.size() + 1;
-            if (rec_is_select_park && !at_same_park && anchor_park &&
-                nothing_above) {
-                // Confirm the recorded frame is still the marker.
-                if (cs.size() > rec.stack.size() &&
-                    cs[rec.stack.size()].script == rec.script &&
-                    cs[rec.stack.size()].return_line == rec.line) {
-                    std::vector<oa::runtime::CallFrame> cs2 = interpreter_->call_stack();
-                    cs2.erase(cs2.begin() + rec.stack.size());
-                    inline_event_frame_.reset();
-                    interpreter_->set_call_stack(std::move(cs2));
-                    dropped = true;
-                }
-            }
-        }
-        if (!dropped) {
-            return;
-        }
-        // zombie dropped: fall through and arm the marker at the current park
+bool GameRuntime::RuntimeState::pop_park_context() {
+    ParkContext outer = park_stack_.empty() ? ParkContext{} : std::move(park_stack_.back());
+    if (!park_stack_.empty()) park_stack_.pop_back();
+    // 被弹掉那一层（callee）的停驻随帧一起死：它的 owner 行属于一个已经不存在
+    // 的位置，留着只会让宿主在错误的行上等下一次输入。
+    if (!outer.wait) {
+        park_ = std::move(outer);
+        return false;
     }
-    // Arm at input anchor parks (or unconditionally for a handler that queued tags).
-    if (!force && wait_ && !wait_->is_input_anchor()) return;
-    // The marker is the handler's *only* way back at a top-level park. A frame
-    // that carries a suspended park (a UI session entered over the story with a
-    // handler-issued [call]) already owns the return path: the data's
-    // `[jump <close label>] ... [return]` idiom must unwind to that frame and
-    // restore the story park, not land on the UI's [stop] through a marker
-    // (test13: closing the backlog never came back to the story).
-    {
-        const auto& cs = interpreter_->call_stack();
-        if (!cs.empty() && park_suspensions_.count(cs.back().id) != 0) return;
-    }
-    const std::string* script = interpreter_->current_script();
-    if (!script) return;
-    const size_t line = interpreter_->current_line();
-    std::vector<oa::runtime::CallFrame> stack = interpreter_->call_stack();
-    std::vector<oa::runtime::CallFrame> with_marker = stack;
-    with_marker.push_back(oa::runtime::CallFrame{*script, line});
-    // Stack-only mutation: restore_position would clear queue-wait flags.
-    interpreter_->set_call_stack(with_marker);
-    inline_event_frame_ = InlineEventFrame{*script, line, std::move(stack), false};
-}
-
-void GameRuntime::RuntimeState::settle_inline_event_frame(bool paused, bool has_queued, bool saw_call,
-                                            bool saw_jump) {
-    // Settle mutates only when the marker is still at its recorded index.
-    if (!interpreter_ || !inline_event_frame_) return;
-    if (!inline_event_marker_active()) {
-        // The marker frame left the stack: the helper's own trailing
-        // [return] popped it and the interpreter already resumed the parked
-        // line. Bookkeeping only.
-        inline_event_frame_.reset();
-        return;
-    }
-    const InlineEventFrame rec = *inline_event_frame_;
-    if (saw_call && !rec.claimed_by_jump) {
-        // A real [call] frame protects the park; drop only the marker.
-        std::vector<oa::runtime::CallFrame> cs = interpreter_->call_stack();
-        cs.erase(cs.begin() + rec.stack.size()); // index validated above
-        inline_event_frame_.reset();
-        interpreter_->set_call_stack(std::move(cs));
-        return;
-    }
-    // A jump makes the marker the helper's only way back; claim it.
-    if (saw_jump) inline_event_frame_->claimed_by_jump = true;
-    if (inline_event_frame_->claimed_by_jump || paused || has_queued) {
-        return;
-    }
-    // Nothing can pop the marker: tear it down and restore the pre-arm stack.
-    inline_event_frame_.reset();
-    interpreter_->set_call_stack(rec.stack);
-}
-
-bool GameRuntime::RuntimeState::suspend_park_on_jump(uint64_t frame_id) {
-    // A handler-issued [jump] into another script is an escape from the page
-    // the player is reading: the flow it enters ends with its own [return],
-    // and that return has to land back on that page — with its park and the
-    // script tail queued behind it — instead of unwinding the caller chain
-    // (test13: quick save / quick load ended by popping the story frame, which
-    // turned a page on the way back).
-    // Only a page CLICK wait qualifies. A [stop] or a timer belongs to a flow
-    // that is already over (UI screens, menus): the jump owns the execution
-    // there, and their own ReturnStack()/[return] choreography must not meet an
-    // extra frame (closing the backlog goes through exactly that path).
-    if (!interpreter_ || frame_id == 0) return false;
-    if (!wait_ || !wait_->waiting_click()) return false;
-    return suspend_park_on_frame(frame_id);
-}
-
-bool GameRuntime::RuntimeState::suspend_park_on_frame(uint64_t frame_id) {
-    if (!interpreter_ || frame_id == 0) return false;
-    // A call only takes a continuation over when something is actually parked
-    // (or queued behind a park). A call from a running script keeps the same
-    // execution context and must not suspend anything.
-    if (!wait_ && pending_parks_.empty()) return false;
-    ParkSuspension s;
-    if (wait_) {
-        s.wait = std::move(*wait_);
-        s.has_wait = true;
-        wait_.reset();
-    }
-    s.tail = std::move(parked_tail_);
-    parked_tail_.clear();
-    s.pending = std::move(pending_parks_);
-    pending_parks_.clear();
-    pending_custom_.clear();
-    pending_sync_tweens_.clear();
-    park_suspensions_[frame_id] = std::move(s);
-    return true;
-}
-
-bool GameRuntime::RuntimeState::restore_park_from_frame(uint64_t frame_id) {
-    const auto it = park_suspensions_.find(frame_id);
-    if (it == park_suspensions_.end()) return false;
-    ParkSuspension s = std::move(it->second);
-    park_suspensions_.erase(it);
     const auto at_park_line = [this](const oa::runtime::Wait& w) {
         const std::string* script = interpreter_ ? interpreter_->current_script() : nullptr;
         return script && w.owner_script == *script && w.owner_line == interpreter_->current_line();
     };
-    // A park belongs to the script line that armed it. A handler-issued [jump]
-    // can move the script while the frame holding the park is still open (the
-    // framework queues [call <file> last] preload rows right next to such
-    // jumps); restoring the park on the new line leaves the story waiting at a
-    // line it already left, and every later press re-runs that same line
-    // forever (test13 backlog row jump: the confirmation dialog answered once
-    // and then nothing responded).
-    if (s.has_wait && !at_park_line(s.wait)) {
-        // Stale: hand its deferred tail back so no cleanup is lost, then let
-        // execution continue from where the flow actually is.
-        if (!s.tail.empty()) interpreter_->prepend_tags(std::move(s.tail));
-        s.tail.clear();
-        s.has_wait = false;
+    // 停驻属于武装它的那一行。处理函数发的 [jump] 可以让脚本在持帧期间就换
+    // 位置（框架会把 [call <file> last] 预载行排在 jump 旁边）；把停驻恢复到
+    // 新行上会让剧情停在一个它已经离开的位置，之后每次按键都重跑那一行
+    // （test13 backlog 行跳转：确认框只响应一次）。
+    if (!at_park_line(*outer.wait)) {
+        // 过期：把它的尾巴交回队列（清理 tag 不能丢），执行从流程实际所在的
+        // 位置继续。
+        if (!outer.tail.empty()) interpreter_->prepend_tags(std::move(outer.tail));
+        outer.tail.clear();
+        outer.wait.reset();
+        park_ = std::move(outer);
+        return false;
     }
-    // The callee may have left its own park behind (a UI screen that closed
-    // without returning). A park still standing on THIS line is legitimate and
-    // stays; one left on another line goes.
-    if (wait_ && !at_park_line(*wait_)) wait_.reset();
-    if (s.has_wait) {
-        wait_ = std::move(s.wait);
-        // Re-arm for THIS tick and refuse this tick's input: the press that
-        // closed the UI is the UI's command, not the story's next page turn.
-        wait_->armed_tick = tick_count_;
-        wait_->seq = ++wait_seq_;
-        wait_->auto_elapsed_ms = 0;
-        wait_->restored = true;
-    }
-    if (!s.tail.empty()) parked_tail_ = std::move(s.tail);
-    pending_parks_ = std::move(s.pending);
-    return wait_.has_value();
+    park_ = std::move(outer);
+    // 重新武装：关闭 UI 的那一次按键是 UI 的命令，不是剧情下一页的翻页键。
+    park_.wait->armed_tick = tick_count_;
+    park_.wait->seq = ++wait_seq_;
+    park_.wait->auto_elapsed_ms = 0;
+    park_.wait->restored = true;
+    return true;
 }
 
-bool GameRuntime::RuntimeState::ui_session_open() {
-    if (!interpreter_) return false;
-    lua_State* L = interpreter_->lua_bridge().state();
-    if (!L) return false;
-    const int top = lua_gettop(L);
-    bool open = false;
-    lua_getglobal(L, "adv");
-    if (lua_istable(L, -1)) {
-        lua_getfield(L, -1, "func");
-        open = !lua_isnil(L, -1);
-    }
-    lua_settop(L, top);
-    return open;
+void GameRuntime::RuntimeState::reset_park_contexts() {
+    park_ = ParkContext{};
+    park_stack_.clear();
 }
 
-void GameRuntime::RuntimeState::settle_ui_session_park() {
-    // The framework's UI screens are [call]s into system/ui.asb: opening one
-    // suspends the page park on the frame the call pushed. Closing it clears
-    // adv.func, but the frames the screen opened do not always unwind —
-    // ui_return jumps back into the UI script, and its [return] lands on the
-    // script's own [stop], which then re-arms on every press while the story
-    // page sits below it in the stack (test13: save/load left the game alive
-    // but deaf, cursor on ui.asb:1 with adv.func already nil).
-    //
-    // When the session is gone and the live wait still belongs to the
-    // framework script the screen opened, roll the stack back to the page and
-    // hand it back to the reader.
-    if (!save_ui_recovery_ || !interpreter_ || !wait_) return;
-    const std::string* cur = interpreter_->current_script();
-    // Only a framework-side wait is a candidate: the story page's own park is a
-    // scenario script and must never be rolled back this way.
-    if (!cur || wait_->owner_script.compare(0, 7, "system/") != 0) return;
-    if (ui_session_open()) return;
 
-    // The screen never ran the framework's return-to-game tail; that is where
-    // the ADV keys, the message-window buttons and the vsync mode are put back.
-    // Without it the page is on screen but the bar under it is dead (its fade-in
-    // never advances) and a press falls through to the story. Titles that do
-    // not have these helpers simply skip them.
-    const auto run_return_tail = [this] {
-        for (const char* fn : {"return_to_game_common2", "key_start_adv", "mw_btnon"}) {
-            try {
-                (void)interpreter_->lua_bridge().call_function(fn, {});
-            } catch (const std::exception&) {
-            }
-        }
-    };
 
-    auto it = park_suspensions_.begin();
-    while (it != park_suspensions_.end()) {
-        if (it->second.has_wait &&
-            it->second.wait.owner_script.compare(0, 7, "system/") != 0)
-            break;
-        ++it;
-    }
-    if (it == park_suspensions_.end()) {
-        // A load has no suspended park (loading clears them): its save carries
-        // the story frame instead. Land there and wait for the reader.
-        if (!loaded_story_frame_valid_) return;
-        loaded_story_frame_valid_ = false;
-        std::vector<oa::runtime::CallFrame> cs = interpreter_->call_stack();
-        size_t keep = cs.size();
-        for (size_t i = 0; i < cs.size(); ++i) {
-            if (cs[i].script == loaded_story_script_ &&
-                cs[i].return_line == loaded_story_line_) {
-                keep = i;
-                break;
-            }
-        }
-        cs.resize(keep);
-        interpreter_->set_call_stack(std::move(cs));
-        (void)interpreter_->set_position(loaded_story_script_, loaded_story_line_);
-        oa::runtime::Wait w;
-        w.release = oa::runtime::Wait::OnClick;
-        w.wakes = oa::runtime::Wait::WakeClick;
-        arm_park(std::move(w), true);
-        run_return_tail();
-        save_ui_recovery_ = false;
-        return;
-    }
 
-    const uint64_t frame_id = it->first;
-    ParkSuspension s = std::move(it->second);
-    park_suspensions_.erase(it);
-    // Drop every frame the screen pushed on top of the one that opened it.
-    std::vector<oa::runtime::CallFrame> cs = interpreter_->call_stack();
-    for (size_t i = 0; i < cs.size(); ++i) {
-        if (cs[i].id == frame_id) {
-            cs.resize(i);
-            break;
-        }
-    }
-    interpreter_->set_call_stack(std::move(cs));
-    (void)interpreter_->set_position(s.wait.owner_script, s.wait.owner_line);
-    save_ui_recovery_ = false;
-    wait_ = std::move(s.wait);
-    wait_->armed_tick = tick_count_;
-    wait_->seq = ++wait_seq_;
-    wait_->auto_elapsed_ms = 0;
-    wait_->restored = true;
-    if (!s.tail.empty()) parked_tail_ = std::move(s.tail);
-    pending_parks_ = std::move(s.pending);
-    run_return_tail();
-}
 
 
 void GameRuntime::RuntimeState::force_pointer_drag(const std::string& layer_id) {
@@ -2815,6 +2858,9 @@ bool GameRuntime::RuntimeState::drag_begin(const std::string& layer_id, bool for
     const auto offset = scene().layer_offset(layer_id);
     if (!offset) return false;
     pointer_.drag_layer_ = layer_id;
+    // 记下目标实例：这一层中途被 [lydel]+[lyc] 换掉时，序列立即作废
+    // （后面那些 drag/dragout 回调属于已经不存在的那个层）。
+    pointer_.drag_generation_ = scene().generation_of(layer_id);
     pointer_.drag_start_mouse_x_ = double(input_state_.mouse_x_);
     pointer_.drag_start_mouse_y_ = double(input_state_.mouse_y_);
     pointer_.drag_origin_left_ = offset->first;
@@ -3423,7 +3469,8 @@ void App::Impl::dump_state()
         }
     }
     if (std::getenv("OA_TXTDUMP")) {
-        for (const auto& [id, ml] : rt->text().layers()) {
+        for (const auto& [id, mlp] : rt->text().all_layers()) {
+            const oa::render::MessageLayer& ml = *mlp;
             std::string raw;
             for (const auto& u : ml.page)
                 raw += u.kind == oa::render::PageUnit::Kind::Newline
@@ -3431,12 +3478,12 @@ void App::Impl::dump_state()
                            : u.data;
             const oa::render::Layer* node = rt->scene().find(id);
             std::fprintf(stderr,
-                         "[txt] %-24s chars=%zu reveal=%zu pend=%d hidden=%d "
+                         "[txt] %-24s chars=%zu shown=%zu done=%d hidden=%d "
                          "positioned=%d page=%zu alpha=%.2f vis=%d eff=%d "
                          "box=(%.0f,%.0f %.0fx%.0f) size=%.0f align=%s "
                          "sample='%.40s'\n",
-                         id.c_str(), ml.char_count, size_t(ml.reveal_index),
-                         ml.reveal_pending ? 1 : 0, ml.text_hidden ? 1 : 0,
+                         id.c_str(), ml.char_count, ml.shown,
+                         ml.done ? 1 : 0, ml.text_hidden ? 1 : 0,
                          ml.positioned ? 1 : 0, ml.page.size(),
                          node ? node->alpha : -1.0,
                          node ? (node->visible ? 1 : 0) : -1,
@@ -3616,7 +3663,10 @@ bool App::boot()
 
 bool App::attach_window(void* native_window)
 {
-    if (!impl_->rt || !impl_->rt->attach_window(native_window, impl_->cfg.renderer))
+    // 静音模式连音频设备都不开（headless / --mute）：没有 sink，任何一条
+    // 音频通路（含视频自带音轨）都无处输出。
+    if (!impl_->rt || !impl_->rt->attach_window(native_window, impl_->cfg.renderer,
+                                                !impl_->cfg.mute))
         return false;
     impl_->reset_clock();
     return true;
@@ -3673,5 +3723,8 @@ AppResult App::tick()
 {
     return impl_->tick();
 }
+
+GameRuntime& App::runtime() { return *impl_->rt; }
+const GameRuntime& App::runtime() const { return *impl_->rt; }
 
 } // namespace oa::runtime

@@ -565,8 +565,8 @@ Value infer_official_value(const std::string& raw) {
 }
 
 bool official_key_is_host_path(const std::string& key) {
-    // 实测两份官方存档都带这两个键，值形如
-    // "C:\\Users\\koichi\\Documents\\…" / "C:\\artemis\\testgame\\test13"。
+    // 实测两份官方存档都带这两个键，值是写档那台机器上的绝对路径
+    // （用户目录 / 安装盘下的游戏目录）。
     return key == "s.datapath" || key == "s.savepath" || key == "datapath" ||
            key == "savepath";
 }
@@ -746,7 +746,7 @@ void emit_pluto(oa::util::Writer& w, const PlutoPtr& v) {
 
 } // namespace
 
-bool looks_like_official_pluto(const std::string& raw) {
+bool looks_like_official_pluto(std::string_view raw) {
     if (raw.size() < 12) return false;
     const auto u32 = [&raw](size_t off) {
         uint32_t v = 0;

@@ -20,6 +20,7 @@ extern "C" {
 }
 
 #include "core/runtime/runtime_iet.h"
+#include "core/runtime/runtime_save_official.h" // 官方 native Pluto 的只读解码
 #include "core/util/binary_stream.h"
 
 namespace oa::runtime {
@@ -468,6 +469,11 @@ int l_tag(lua_State* L) {
             lua_pushliteral(L, "var application failed");
             return lua_error(L);
         }
+        return 0;
+    }
+    // ReturnStack：会话里发 [return] 就是"把当前 UI 栈收掉"，立即生效。
+    if (tag == "return" && bridge->host().handler_return &&
+        bridge->host().handler_return()) {
         return 0;
     }
     // e:tag{"calllua",...} from Lua runs synchronously (the
@@ -1199,18 +1205,30 @@ int l_create_emote_layer(lua_State* L) {
         lua_push_emote_layer_object(L, bridge, id);
         return 1;
     }
-    // Real static layer. Materialize the carrier chain
-    // through the normal tag queue (an empty lyc2 at the full dotted id
-    // creates every missing ancestor too), then ask the runtime to decode
-    // the first psb file and render the static pose onto that layer.
-    if (bridge->host().enqueue_tag) {
-        bridge->host().enqueue_tag("lyc2", {{"id", id}});
+    // Real static layer. The carrier chain must appear **now**: the framework
+    // uses createEmoteLayer for cache-only layers too
+    // (`emote.cacheinit()` creates id=999.N with width/height 0 and deletes
+    // the subtree on the next line with `lydel2(999)`). `e:tag` executes
+    // immediately, so queueing lyc2 here made the delete run first and the
+    // cache layer survive forever — it then rendered a full-stage pose on top
+    // of the brand logo (the stray white dot). Materialize synchronously:
+    // an empty lyc2 at the full dotted id creates every missing ancestor too.
+    const auto fire = [&bridge](const std::string& tag,
+                                std::map<std::string, std::string> params) {
+        if (bridge->host().run_tag_now) {
+            if (bridge->host().run_tag_now(tag, params)) return;
+        }
+        if (bridge->host().enqueue_tag)
+            bridge->host().enqueue_tag(tag, std::move(params));
+    };
+    fire("lyc2", {{"id", id}});
+    {
         std::map<std::string, std::string> p;
         p["id"] = id;
         p["files"] = files;
         if (width > 0) p["width"] = std::to_string(width);
         if (height > 0) p["height"] = std::to_string(height);
-        bridge->host().enqueue_tag("emotestatic", std::move(p));
+        fire("emotestatic", std::move(p));
     }
     lua_push_emote_layer_object(L, bridge, id);
     return 1;
@@ -1589,6 +1607,25 @@ int l_pluto_persist(lua_State* L) {
     }
 }
 
+/// 官方（原生引擎）`pluto.persist` 的二进制 → 本引擎的标签流 → 压一张表。
+/// 返回 true = 已经压好表；false = 不是官方 Pluto（或转换失败），调用方按
+/// 原来的错误路径处理。
+bool try_official_pluto(lua_State* L, const char* s, size_t len) {
+    const std::string_view raw(s, len);
+    if (!oa::runtime::looks_like_official_pluto(raw)) return false;
+    const auto converted = oa::runtime::convert_official_pluto(raw);
+    if (!converted) return false;
+    try {
+        oa::util::Reader r(reinterpret_cast<const uint8_t*>(converted->data()),
+                           converted->size());
+        read_pluto_value(L, r, 0);
+        r.expect_eof("pluto unpersist (official)");
+    } catch (const std::exception&) {
+        return false;
+    }
+    return lua_type(L, -1) == LUA_TTABLE;
+}
+
 int l_pluto_unpersist(lua_State* L) {
     if (lua_type(L, 2) != LUA_TSTRING) {
         lua_newtable(L);
@@ -1603,6 +1640,16 @@ int l_pluto_unpersist(lua_State* L) {
         r.expect_eof("pluto unpersist");
     } catch (const std::exception& e) {
         lua_settop(L, base);
+        // 官方 native Pluto（包内的 system/sino.dat、原生引擎写的 conf.dat /
+        // global.dat）：格式家族不同，但内容是同一棵 Lua 表。这里转一次再读，
+        // 玩家从原生引擎搬来的进度与设置就能直接用。
+        if (try_official_pluto(L, s, len)) {
+            std::fprintf(stderr,
+                         "[lua] pluto.unpersist: official native Pluto document (%zu bytes) "
+                         "converted\n",
+                         len);
+            return 1;
+        }
         // 契约：读不出来就给空表（游戏侧 fload_pluto 拿 {} 也能跑）。但**静默**
         // 失败会把人坑死：test4 的 g.config 是官方 native Pluto 的字节，读完
         // 变成 {}，于是 conf.language 丢失、每次启动都重弹语言选择，而日志里

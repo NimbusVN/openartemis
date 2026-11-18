@@ -1,170 +1,40 @@
 #pragma once
-// oa::render — Artemis message-layer text engine: message-layer stack/switch/pop, (scetween), backlog reproduction tags, glyph click-wait i...
+// oa::render — Artemis 消息层文本引擎。
+//
+// 存储归属：文本内容挂在**节点**上（Layer::text / text_state.h）。TextEngine
+// 只做三件事：
+//   1. 编辑当前页（[chgmsg]/[font]/[print]/[rp]/[rt]/[scetween]…）；
+//   2. 按绝对时钟推进逐字显示（advance(now_ms)）；
+//   3. 维护会话级的排版配置（TextProfile：框架只在启动时设一次 font）。
+//
+// 未接场景时（单元测试直接 `TextEngine e;`）用内部 map 顶替 —— 存储是
+// 可替换的，算法只有一份。
 #include <cstdint>
 #include <functional>
 #include <map>
 #include <optional>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
+
+#include "core/render/text_state.h"
 
 namespace oa::render {
 
-inline constexpr std::string_view kDefaultMessageLayer = "adv01";
-inline constexpr double kDefaultFontSize = 40.0;
-/// 缺省字体文件候选（runtime load_default_font）。
-inline constexpr std::string_view kDefaultFontFile = "font/sourcehansans-medium.otf";
-inline constexpr size_t kBacklogMaxPages = 100;
-
-// ---------------------------------------------------------------------------
-// Font settings: 保形参数表 + 少量 typed 取用（FontDesc）
-// ---------------------------------------------------------------------------
-struct FontDesc {
-    std::map<std::string, std::string> raw;
-    void merge_raw(const std::map<std::string, std::string>& p);
-    const std::string* get(std::string_view key) const;
-    std::string get_or(std::string_view key, const std::string& fallback) const;
-    double size() const;
-    std::string face() const;
-    std::string color() const;
-    double spacetop() const;
-    double spacemiddle() const;
-    double spacebottom() const;
-    double rubysize() const;
-};
-
-// ---------------------------------------------------------------------------
-// Page units：一页文本的逻辑单元流（排版输入）
-// ---------------------------------------------------------------------------
-struct PageUnit {
-    enum class Kind { Text, Newline, RubyBase };
-    Kind kind = Kind::Text;
-    std::string data;
-    std::string ruby_annotation;
-    FontDesc font;
-};
-
-// ---------------------------------------------------------------------------
-// scetween / backlog 再现 / glyph 图标
-// ---------------------------------------------------------------------------
-enum class ScetweenMode {
-    In, Out, Show, Hide, BacklogDownIn, BacklogDownOut, BacklogUpIn, BacklogUpOut,
-};
-
-struct ScetweenConfig {
-    ScetweenMode mode = ScetweenMode::In;
-    bool set_add = false; // [scetween mode=add] vs init
-    std::string param;    // "alpha"/"left"/...
-    std::string ease;
-    double diff = 0;
-    uint64_t delay_per_char = 0; // [scetween delay=]
-    uint64_t time_per_char = 0;  // [scetween time=]
-    bool random_delay = false;
-    bool is_entrance() const {
-        return mode == ScetweenMode::In || mode == ScetweenMode::Show ||
-               mode == ScetweenMode::BacklogDownIn || mode == ScetweenMode::BacklogUpIn;
-    }
-};
-
-/// backlog 页内再现标签（BacklogTag）。
-struct BacklogTag {
-    enum class Kind { Text, LineBreak, Font, RubyStart, RubyEnd };
-    Kind kind = Kind::Text;
-    std::string text;
-    std::map<std::string, std::string> font;
-    std::string get_string() const;
-};
-
-struct BacklogPage {
-    std::map<std::string, std::string> page_font;
-    std::vector<BacklogTag> tags;
-    bool has_text() const;
-    std::vector<std::string> reproduction_tags(bool allfont) const;
-};
-
-struct GlyphIconConfig {
-    std::string layer;    // 行末图标层（缺省禁用）
-    std::string rplayer;  // 页末图标层（缺省=layer）
-    double left = 0, top = 0, rpleft = 0, rptop = 0;
-    bool homing = false;
-};
-
-struct ClickWaitPlacement {
-    std::string layer_id;
-    double left = 0;
-    double top = 0;
-};
-
-// ---------------------------------------------------------------------------
-// Layout（纯排版）
-// ---------------------------------------------------------------------------
-struct CharMetrics {
-    double advance = 0;
-    double width = 0;
-    double height = 0;
-};
-using MetricsFn = std::function<CharMetrics(void* userdata, const FontDesc&, uint32_t cp)>;
-
-struct LayoutConfig {
-    std::string prohibit_head;
-    std::string prohibit_foot;
-    std::string wordparts;
-    std::string indent_pair;
-    int indent_range = 0;
-    bool indent_nest = false;
-};
-
-struct LaidGlyph {
-    uint32_t cp = 0;
-    double advance = 0;
-    double width = 0;
-    double x = 0;
-    uint32_t line = 0;
-    const FontDesc* font = nullptr;
-    bool newline = false;
-    bool has_ruby = false;
-    size_t order = 0; // 页内字形序号（reveal_index 过滤用）
-};
-struct LaidRuby {
-    uint32_t line = 0;
-    double x = 0;
-    double width = 0;
-    std::string text;
-    double size = 0;
-};
-struct LaidPage {
-    std::vector<LaidGlyph> glyphs;
-    std::vector<LaidRuby> rubies;
-    double line_height = 0;
-};
-
-struct MessageLayer {
-    std::string id;
-    bool layered = false;
-    /// 该层是否被 [font] 排版键（left/top/width/height 任一）显式配置过绘制
-    /// 盒。字体几何是 Artemis 文本的唯一落点来源（每张字表自带 rect）;
-    /// 从未排版过的层 = 无绘制盒,只能画在脚本显式创建的节点上
-    /// （is_message_layer_drawable 门槛,孤儿打印不绘制）。
-    bool positioned = false;
-    double left = 0, top = 0, width = 0, height = 0;
-    FontDesc font;
-    std::vector<FontDesc> font_stack;
-    bool text_hidden = false;
-    /// [lydel] took the scene node away: the layer is not on screen any more
-    /// and must not be written into a save (a [chgmsg] on the same id clears
-    /// it — the framework starting a new page on that row).
-    bool scene_gone = false;
-    std::vector<PageUnit> page;
-    uint64_t generation = 0;
-    // reveal/scetween/backlog
-    uint64_t reveal_index = 0;
-    bool reveal_pending = false;
-    uint64_t reveal_clock_ms = 0;
-    bool reveal_fresh = false;
-    std::vector<ScetweenConfig> scetween;
-    std::vector<BacklogTag> page_tags;
-    std::map<std::string, std::string> page_font;
-    size_t char_count = 0; // 页单元展平字形数（reveal 上限）
+/// 文本存储（场景实现；Compositor 提供）。
+///
+/// 生命周期由节点决定：节点被删，find_text 就返回 nullptr，ensure_text 会
+/// 为新节点造一份。TextEngine 不持有"幽灵层"。
+class TextStore {
+public:
+    virtual ~TextStore() = default;
+    /// 该 id 节点上的文本；节点不存在或没有文本 → nullptr。
+    virtual MessageLayer* find_text(const std::string& id) = 0;
+    /// 该 id 节点上的文本，没有就建（节点不存在时由实现决定是否物化）。
+    virtual MessageLayer& ensure_text(const std::string& id) = 0;
+    /// 所有承载文本的 id（顺序不保证；仅用于遍历/快照）。
+    virtual std::vector<std::string> text_ids() const = 0;
 };
 
 // ---------------------------------------------------------------------------
@@ -173,6 +43,11 @@ struct MessageLayer {
 class TextEngine {
 public:
     TextEngine();
+    ~TextEngine();
+
+    /// 接上场景存储。`nullptr` = 断开，回到内部 map。
+    void attach(TextStore* store);
+    bool attached() const { return store_ != nullptr; }
 
     void clear_scene();
     /// 把活动层锚回"当前持有可见页内容的层"：页面点击等待释放时调用
@@ -183,13 +58,10 @@ public:
     void switch_layer(std::optional<std::string> id, bool stack,
                       std::optional<int> layered);
     void pop_layer();
-    /// [lydel]: the scene node (and its subtree) is gone. Hide the message
-    /// layers instead of erasing them: the framework initialises rows like the
-    /// backlog's 500.100.x ONCE at boot (font box + page), and a later screen
-    /// rebuild only re-prints into the same layer — erasing it would lose the
-    /// layout. Hidden layers stay out of visible_content_layers() and out of
-    /// save snapshots; [chgmsg] makes a layer visible again.
-    void hide_layer(const std::string& id, bool subtree = true);
+    /// 节点（及子树）被删：[lydel] 的文本侧收尾。**只丢内容**（页/游标/
+    /// 隐藏标记/重打快照），保留会话配置（TextProfile），这样同一 id 的
+    /// 下一次 [chgmsg] 还能拿到排版。
+    void forget_node(const std::string& id);
     // font 族
     void apply_font(const std::map<std::string, std::string>& p);
     void font_init();
@@ -198,6 +70,9 @@ public:
     // 文本：push_text 把内容按 '\n' 归一为 (Text 段 | Newline 单元) 序列
     // （内容内 LF == [rt] 断行语义；CRLF 的 '\r' 丢弃）。
     void push_text(const std::string& content);
+    /// 读档恢复的页：这一层下一次 `push_text` 是整页替换而不是追加
+    /// （见 MessageLayer::reload_replace_pending）。
+    void arm_reload_replace(const std::string& id);
     void line_break(bool omit_blank_line);
     void page_break(std::optional<int> backlog_param);
     // ruby
@@ -216,9 +91,13 @@ public:
     // [backlog]/[writebacklog]
     void apply_backlog_config(const std::map<std::string, std::string>& p, bool clear);
     void set_backlog_write_mode(bool mode);
-    // reveal 驱动
-    void reveal_next(uint64_t delta_ms);
+    // reveal 驱动（绝对时钟）
+    /// 把所有**未完成**的页推进到 now_ms。不再接受 delta：一帧卡多长都
+    /// 不会让速度永久落后。
+    void advance(uint64_t now_ms);
     void reveal_all();
+    /// 是否所有承载内容的页都显示完了。只看**有字的页**：空层/隐藏层/测量
+    /// 层不参与判定（以前遍历全表，一个残留 pending 就卡死翻页）。
     bool is_reveal_complete() const;
     /// 有页面正在"逐字"（存在非零间隔）——瞬显页不算，避免吃掉点击。
     bool is_reveal_paced() const;
@@ -243,8 +122,9 @@ public:
                                                          bool allfont) const;
 
     // --- 内部/测试观察 ---
-    size_t text_layers() const { return layers_.size(); }
-    const std::map<std::string, MessageLayer>& layers() const { return layers_; }
+    size_t text_layers() const;
+    /// 全部承载文本的 (id, 层)。快照/dump 用；顺序按 id 升序。
+    std::vector<std::pair<std::string, const MessageLayer*>> all_layers() const;
     const std::vector<std::string>& layer_stack() const { return layer_stack_; }
 
 private:
@@ -253,14 +133,28 @@ private:
     std::string anon_id();
     size_t recompute_char_count(MessageLayer& l) const;
     std::vector<BacklogTag> page_tags_of(const MessageLayer& l) const;
+    // 存储访问（attach 与否的唯一分叉）
+    MessageLayer* find_text(const std::string& id) const;
+    MessageLayer& ensure_text(const std::string& id);
+    std::vector<std::string> text_ids() const;
+    /// 会话配置：apply_font 等写这里，节点重建时 ensure_text 用它恢复。
+    TextProfile& profile(const std::string& id);
+    void save_profile(const std::string& id, const MessageLayer& l);
+    /// 把 profile 还原进一个刚建出来的层。
+    void apply_profile(const std::string& id, MessageLayer* l);
+
     std::optional<std::string> active_;
     std::vector<std::string> layer_stack_;
-    std::map<std::string, MessageLayer> layers_;
+    TextStore* store_ = nullptr;                 // 非空 = 内容在场景节点上
+    mutable std::map<std::string, MessageLayer> own_; // 未接场景时的存储
+    std::map<std::string, TextProfile> profiles_;     // id → 会话配置
     FontDesc default_font_;
     uint64_t revision_ = 0;
     bool ruby_open_ = false;
     std::string ruby_annotation_;
     uint64_t anonymous_serial_ = 0;
+    /// 最近一次 advance 的时钟（[scetween] 改速度时用它反解 start_ms）。
+    uint64_t last_now_ms_ = 0;
     LayoutConfig layout_cfg_;
     // session state
     std::vector<BacklogPage> backlog_pages_;

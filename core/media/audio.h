@@ -228,7 +228,9 @@ public:
     static constexpr int kOutputRate = 44100;
 
     // base
-    bool init();
+    /// `open_device=false` = 纯静音：不初始化 SDL 音频、不打开设备。
+    /// 解码/完成事件照常跑（状态机不受影响），只是没有任何一条路能出声。
+    bool init(bool open_device = true);
     void release();
     ~MediaPlayers(); // cancels prefetch workers before the players die
 

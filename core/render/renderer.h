@@ -226,6 +226,13 @@ public:
     /// Memory probes: live cache entries.
     CacheStats cache_stats() const;
 
+    /// 一份**就地重写**的资源：丢掉缓存的像素和图，按新文件重新上传，并标脏。
+    ///
+    /// 存档缩略图（[savess]）就是这样：层按文件名缓存贴图，覆盖存档后文件换了
+    /// 但名字没变，不重新上传就一直画旧图（"覆盖存档后缩略图不换"）。
+    /// name = 层 content key（path + file，通常不带扩展名）。
+    void forget_asset(const std::string& name);
+
 private:
     RenderEngine();
     void configure(const oa::fs::IFileSystem* fs, oa::render::RenderHost* host,

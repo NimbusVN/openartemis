@@ -359,6 +359,7 @@ const Layer* Compositor::find(const std::string& id) const {
 SceneNode* Compositor::make_node(SceneNode* parent, const std::string& id) {
     auto node = std::make_unique<SceneNode>();
     node->layer.id = id;
+    node->layer.generation = next_generation_++;
     node->parent = parent;
     SceneNode* raw = node.get();
     nodes_.emplace(id, std::move(node)); // 所有权+索引；map 元素地址稳定
@@ -414,18 +415,13 @@ void Compositor::clear_scene() {
     // handler registries/message bindings) and the "!" root props.
     nodes_.clear();
     roots_.clear();
-    message_slots_.clear();
-    message_slot_of_.clear();
-    next_message_slot_serial_ = 0;
     root_props_ = Layer{};
     anim_->tweens_.clear();
     anim_->collecting_set_ = false;
     anim_->set_pending_.clear();
     anim_->anime_states_.clear();
     input_handlers_.clear();
-    message_layer_bindings_.clear();
     default_message_layer_.reset();
-    deleted_message_layers_.clear();
     // 簿记: 全场景结构性清空 = "*" 内容写
     // (reset/load 面;现状 legacy 无对应计数)。
     // 全节点内容消亡 = 内容写,经统一收口
@@ -507,6 +503,35 @@ static void cleanup_message_layers_of_subtree(
     }
 }
 
+// ---------------------------------------------------------------------------
+// TextStore：文本内容挂在节点上（Layer::text）
+// ---------------------------------------------------------------------------
+oa::render::MessageLayer* Compositor::find_text(const std::string& id) {
+    Layer* l = find_mut(id);
+    return l ? l->text.get() : nullptr;
+}
+
+oa::render::MessageLayer& Compositor::ensure_text(const std::string& id) {
+    // 文本宿主节点可以被 [chgmsg] 直接指定（layered=1 的 `1.90.0` 这种），
+    // 所以这里要物化。**只有这一条路径**（和 [lyc]）会凭空建节点：
+    // [lyprop] 的物化是 A6 的既定语义，留给它自己。
+    ensure_path(id);
+    Layer* l = find_mut(id);
+    if (!l->text) {
+        l->text = std::make_shared<oa::render::MessageLayer>();
+        l->text->id = id;
+    }
+    return *l->text;
+}
+
+std::vector<std::string> Compositor::text_ids() const {
+    std::vector<std::string> out;
+    for (const auto& [id, node] : nodes_) {
+        if (node->layer.text) out.push_back(id);
+    }
+    return out;
+}
+
 void Compositor::remove(const std::string& id) {
     SceneNode* n = find_node(id);
     if (!n) return; // scene.delete on missing id -> 0, no-op
@@ -523,30 +548,20 @@ void Compositor::remove(const std::string& id) {
     // (which drops all playbacks) rebuilt the scene.
     for (const std::string& sid : subtree_ids) anim_->anime_states_.erase(sid);
     // message-layer registry cleanup
-    cleanup_message_layers_of_subtree(subtree_ids, &message_layer_bindings_,
-                                      &default_message_layer_,
-                                      &deleted_message_layers_);
-    // 摘除并释放整棵子树（nodes_ 是唯一所有者；erase 即析构）。
-    if (n->message_slot) {
-        // 槽节点不在 roots 树;从消息槽区摘除并清消息→槽映射
-        // (防悬垂)。
-        message_slots_.erase(std::remove(message_slots_.begin(),
-                                         message_slots_.end(), n),
-                             message_slots_.end());
-        for (auto it = message_slot_of_.begin(); it != message_slot_of_.end();) {
-            if (it->second == id)
-                it = message_slot_of_.erase(it);
-            else
-                ++it;
-        }
-    } else {
-        detach_node(n);
+    // 默认消息层若落在被删子树里就清掉（其余没有绑定表可清）。
+    if (default_message_layer_.has_value() &&
+        (subtree_ids.count(*default_message_layer_) != 0)) {
+        default_message_layer_.reset();
     }
+    // 摘除并释放整棵子树（nodes_ 是唯一所有者；erase 即析构）。
+    detach_node(n);
     for (const std::string& s : sub) {
         // 簿记: 整棵被删子树逐 id 记内容写(节点不
         // 存在时的 lydel no-op 不记 —— legacy 仍保守计数);
         // 统一收口(角色随节点消亡,无重派生 —— 收敛表行 remove)
         touch();
+        // 节点析构 → Layer::text 的 shared_ptr 释放 → 这一页文本随之消失。
+        // 不需要"通知文本引擎"：文本没有独立的存在。
         nodes_.erase(s);
     }
 }
@@ -579,7 +594,7 @@ void Compositor::clear_tweens_of_subtree(const std::set<std::string>& subtree_id
 
 void Compositor::set_props(const std::string& id,
                            const std::map<std::string, std::string>& props) {
-    ensure_path(id); // lyprop on a missing id materializes the node
+    ensure_path(id); // lyprop on a missing id materializes the node (A6)
     Layer* l = find_mut(id);
     // [lyprop] does NOT author the node for text drawing.
     l->set_props(props);
@@ -695,9 +710,6 @@ std::vector<const Layer*> Compositor::draw_order() const {
     // stable_sort 序(compare_ids 是全序:任意两节点在"最小不同段"处分叉于
     // 某父的不同孩子或祖先-后代,字典序与 DFS 序一致)。
     for (const SceneNode* r : roots_) append_preorder(r, &out);
-    // 消息槽区整段跟在场景区之后(创建序)。旧实现靠 openartemis-<hex>
-    // 命名 + compare_ids 的 message-last 拼写分支垫底;槽顺序现由结构承担。
-    for (const SceneNode* s : message_slots_) out.push_back(&s->layer);
     // Overlay-video slot: a structural topmost layer (never part of the
     // script tree / message slots); it draws last while bound to a texture.
     // 绑定判定 = 角色 textured_content(原
@@ -712,13 +724,12 @@ std::vector<const Layer*> Compositor::draw_order() const {
     // flat 序;槽区不参与 id 排序)。
     std::vector<const Layer*> sorted;
     for (const auto& [id, node] : nodes_)
-        if (!node->message_slot && id != kOverlayNodeId) sorted.push_back(&node->layer);
+        if (id != kOverlayNodeId) sorted.push_back(&node->layer);
     std::stable_sort(sorted.begin(), sorted.end(),
                      [](const Layer* x, const Layer* y) {
                          return compare_ids(x->id, y->id) < 0;
                      });
-    const size_t scene_n =
-        out.size() - message_slots_.size() - (overlay_live ? 1u : 0u);
+    const size_t scene_n = out.size() - (overlay_live ? 1u : 0u);
     assert(std::equal(out.begin(), out.begin() + ptrdiff_t(scene_n),
                       sorted.begin(), sorted.end()));
 #endif
@@ -772,60 +783,13 @@ void Compositor::clear_overlay_file() {
 
 std::string Compositor::ensure_message_scene_node(const std::string& message_id,
                                                   bool layered) {
-    // 去字符串编码 — layered identity 消息直接走宿主树节点(场景区,
-    // ensure_path 按 id 物化);layered=0 独立消息走引擎消息槽(槽区,创建序,
-    // 槽 id 不随消息 id 变化)。返回 scene_id 供调用方绑定/摆位。
-    if (layered) {
-        ensure_path(message_id);
-        return message_id;
-    }
-    // 复用:消息→槽映射(message_slot_of_)独立于绑定表——绑定随宿主子树
-    // 删除被清,而槽是引擎资源,生命周期到 clear_scene/槽被
-    // remove 为止(宿主树删光后继续 print 不得反复建新槽,与旧 hex 确定
-    // 命名复用行为一致)。
-    const auto it = message_slot_of_.find(message_id);
-    if (it != message_slot_of_.end()) {
-        const SceneNode* b = find_node(it->second);
-        if (b && b->message_slot) return it->second;
-    }
-    SceneNode* slot = make_message_slot();
-    message_slot_of_[message_id] = slot->layer.id;
-    return slot->layer.id;
-}
-
-SceneNode* Compositor::make_message_slot() {
-    // 槽节点不进 roots_(场景区):只入 nodes_ 索引 + message_slots_ 槽表。
-    auto node = std::make_unique<SceneNode>();
-    node->layer.id = "@msg" + std::to_string(next_message_slot_serial_++);
-    node->message_slot = true;
-    SceneNode* raw = node.get();
-    nodes_.emplace(raw->layer.id, std::move(node));
-    message_slots_.push_back(raw);
-    return raw;
-}
-
-bool Compositor::is_message_slot(const std::string& id) const {
-    const SceneNode* n = find_node(id);
-    return n && n->message_slot;
-}
-
-std::string Compositor::bound_scene_id(const std::string& message_id) const {
-    const auto it = message_layer_bindings_.find(message_id);
-    return it == message_layer_bindings_.end() ? message_id : it->second;
-}
-
-void Compositor::set_message_layer_binding(const std::string& message_id,
-                                           const std::string& scene_id) {
-    message_layer_bindings_[message_id] = scene_id;
-    deleted_message_layers_.erase(message_id);
-    // 绑定表是帧计划的输入（槽位 → 消息层 id 的归属）：必须让计划失效。
-    // 只递增版本号，不记脏面（不是层内容几何，簿记口径保持不变）。
-    touch();
-}
-
-void Compositor::revive_message_layer(const std::string& message_id) {
-    deleted_message_layers_.erase(message_id);
-    touch();
+    // **消息 id 就是节点 id。** 文本是节点的内容（Layer::text），没有第二个
+    // 载体：不再有"@msgN 槽 + 同名空壳"两份节点，也不存在绑定表。
+    //
+    // layered 只记录在 MessageLayer 上（决定存档/绑定语义），不影响宿主位置。
+    (void)layered;
+    if (!message_id.empty()) ensure_path(message_id);
+    return message_id;
 }
 
 void Compositor::set_default_message_layer(
@@ -836,54 +800,27 @@ void Compositor::set_default_message_layer(
 
 std::optional<std::string> Compositor::resolve_message_target(
     const std::string& raw) const {
+    // `~` 只有一个含义：默认消息层。`~xxx` 就是 xxx（消息 id 即节点 id）。
     if (raw.empty() || raw[0] != '~') return raw;
     const std::string rest = raw.substr(1);
     if (rest.empty()) {
-        // 裸 "~"：默认消息层（未设置 → 忽略本次操作）
         if (!default_message_layer_) return std::nullopt;
-        const auto it = message_layer_bindings_.find(*default_message_layer_);
-        return it == message_layer_bindings_.end() ? *default_message_layer_
-                                                   : it->second;
+        return *default_message_layer_;
     }
-    const auto it = message_layer_bindings_.find(rest);
-    return it == message_layer_bindings_.end() ? rest : it->second;
-}
-
-bool Compositor::is_message_layer_visible(const std::string& message_id) const {
-    // 宿主树/删除/绑定的收敛
-    if (deleted_message_layers_.count(message_id)) return false;
-    const std::string scene_id = bound_scene_id(message_id);
-    const Layer* target = find(scene_id);
-    if (target && !is_effectively_visible(scene_id)) return false;
-    if (target && scene_id == message_id) return true;
-    // overlay 绑定（目标 ≠ 消息 id）或目标缺失：宿主树锚点活性决定。
-    return host_tree_anchor_visible(message_id);
-}
-
-bool Compositor::host_tree_anchor_visible(const std::string& message_id) const {
-    // 消息 id 路径上的最近现存祖先决定显隐：其有效可见性已折叠它上面的整条
-    // 祖先链（is_effectively_visible 沿现存祖先逐段检查）。整条链被删光 =
-    // 宿主窗口树已死（[alldelete] 等）⇒ 多点消息 id 不可见；单段消息 id
-    // （引擎自管 overlay，无宿主树概念）不受树约束。
-    std::string pref = message_id;
-    for (;;) {
-        const size_t dot = pref.rfind('.');
-        if (dot == std::string::npos) break;
-        pref = pref.substr(0, dot);
-        if (find(pref)) return is_effectively_visible(pref);
-    }
-    return message_id.find('.') == std::string::npos;
+    return rest;
 }
 
 bool Compositor::is_message_layer_drawable(const std::string& message_id,
                                            bool text_positioned) const {
-    // 文本绘制门槛 = is_message_layer_visible（宿主树/删除/自身显隐语义）
-    if (!is_message_layer_visible(message_id)) return false;
-    const std::string scene_id = bound_scene_id(message_id);
-    const Layer* target = find(scene_id);
-    if (!target) return false; // 无绘制目标节点
-    if (text_positioned) return true;
-    return target->script_created;
+    // 一条判据：节点在 + 自身可见 + 祖先链可见 + （有绘制盒 或 脚本建的节点）。
+    //
+    // 以前这里要合成"删除标记 / 绑定目标 / 宿主树锚点"三套状态 —— 那是文本
+    // 与节点分家时的产物。文本已经是节点内容，节点可见性就是文本可见性。
+    if (message_id.empty()) return false;
+    const Layer* target = find(message_id);
+    if (!target || !target->visible) return false;
+    if (!is_effectively_visible(message_id)) return false;
+    return text_positioned || target->script_created;
 }
 
 bool Compositor::is_effectively_visible(const std::string& id) const {

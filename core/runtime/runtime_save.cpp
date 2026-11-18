@@ -29,6 +29,26 @@ constexpr const char* kSavegFile = "saveg.dat";
 constexpr const char* kSystemFile = "system.dat";
 constexpr const char* kAutosaveFile = "autosave.dat";
 
+/// 引擎自己的域存档（g./s. 两个变量域）。
+///
+/// **不能再用 system.dat / saveg.dat**：那两个名字是**官方引擎**的
+/// （BOWX / BOWG 容器，原生 exe 写、原生 exe 读）。本引擎的 syssave() 曾经直接
+/// 盖在上面——`preserve_official_original()`（`.official.bak`）就是这个破坏的
+/// 补丁。名字一旦抢过来，玩家搬来的官方系统档（设置、全局进度、已读表）就没了。
+/// 引擎改用自己的一组名字，两边互不覆盖。
+///
+/// 注意：游戏自己的 `sys` 表 / `gscr` 是另两个文件（iMel: conf.dat / global.dat，
+/// 由游戏的 `syssave()` / `system_save()` 用 pluto 写），与这里无关。
+constexpr const char* kSavegOaFile = "saveg.oa.dat";
+constexpr const char* kSystemOaFile = "system.oa.dat";
+
+/// 判断一份文档是不是 OASB 容器（本引擎的 pluto 与域文档都用它当壳）。
+/// 只用于"这份旧文件我们不认识，别动它"的日志分支。
+bool is_oasb_document(const std::string& doc) {
+    return doc.size() >= 4 && oa::util::is_magic(
+                                   reinterpret_cast<const uint8_t*>(doc.data()));
+}
+
 bool is_input_wait(const oa::runtime::Wait* w) {
     return w && (w->waiting_click() || !w->keys.empty());
 }
@@ -118,22 +138,51 @@ bool GameRuntime::RuntimeState::save_file_exists(const std::string& file) const 
 }
 
 // ---------------------------------------------------------------------------
-// System saves (saveg.dat / system.dat)
+// System saves
+//
+// 名字归属（重构后）：
+//   system.dat / saveg.dat       → 官方引擎（BOWX / BOWG）
+//   conf.dat / global.dat        → 游戏（pluto）
+//   system.oa.dat / saveg.oa.dat → 本引擎（g./s. 变量域的 OASB 文档）
+//
+// 读的一侧只保留一条**只读**迁移入口：没有自己的域文档时，把官方 BOWX/BOWG
+// 导入到 g./s.（这是"官方存档能直接用"的读半边）。旧版本引擎留在
+// system.dat / saveg.dat 上的 OASB 原样不动——见下面 OASB 分支。
 // ---------------------------------------------------------------------------
 
 void GameRuntime::RuntimeState::sysload() {
     if (!save_.save_store_) return;
-    for (const bool is_global : {true, false}) {
-        const std::string rel = is_global ? kSavegFile : kSystemFile;
-        const std::string path = qualify_save_file(rel);
-        if (path.empty()) continue;
-        const auto bytes = save_.save_store_->read(path);
-        if (!bytes) continue; // first boot: no file is the default state
+    struct Slot {
+        bool is_global;
+        const char* oa_file;
+        const char* legacy_file;
+    };
+    for (const Slot& slot : {Slot{true, kSavegOaFile, kSavegFile},
+                             Slot{false, kSystemOaFile, kSystemFile}}) {
+        const std::string oa_path = qualify_save_file(slot.oa_file);
+        if (oa_path.empty()) continue;
+        // ① 自己的域文档（权威）。
+        if (const auto bytes = save_.save_store_->read(oa_path)) {
+            try {
+                const auto map = oa::runtime::decode_domain_map(
+                    std::string(bytes->begin(), bytes->end()));
+                const std::string prefix = slot.is_global ? "g." : "s.";
+                for (const auto& [k, v] : map) interpreter_->set_variable(prefix + k, v);
+                std::fprintf(stderr, "[runtime] sysload %s (%zu entries)\n",
+                             oa_path.c_str(), map.size());
+            } catch (const std::exception& e) {
+                std::fprintf(stderr, "[runtime] sysload decode %s failed: %s\n",
+                             oa_path.c_str(), e.what());
+            }
+            continue;
+        }
+        // ② 没有自己的文档：看一眼旧名字，只做**导入**，绝不回写。
+        const std::string legacy = qualify_save_file(slot.legacy_file);
+        if (legacy.empty()) continue;
+        const auto bytes = save_.save_store_->read(legacy);
+        if (!bytes) continue;
         const std::string doc(bytes->begin(), bytes->end());
-        // 官方（原生引擎）写下的 BOW* 容器是**另一个格式家族**：容器/目录/
-        // 值编码都不同（runtime_save_official.h）。以前这里只认 OASB，
-        // 于是玩家把官方 savedata 搬过来只会看到 "bad magic"、设置与全局
-        // 进度全丢。现在按魔数分流，官方档走官方导入器。
+        // 官方（原生引擎）的 BOW* 容器：另一个格式家族（runtime_save_official.h）。
         if (oa::runtime::is_official_save(doc)) {
             try {
                 const auto off = oa::runtime::decode_official_save(doc);
@@ -144,14 +193,13 @@ void GameRuntime::RuntimeState::sysload() {
                 std::fprintf(stderr,
                              "[runtime] sysload %s: official %s v%u -> %zu variable(s), "
                              "%zu host-path key(s) skipped, %zu Pluto table(s) converted\n",
-                             path.c_str(),
-                             is_global ? "BOWG" : "BOWX", off.version, stats.applied,
-                             stats.skipped_host_path, stats.pluto_converted);
+                             legacy.c_str(), slot.is_global ? "BOWG" : "BOWX", off.version,
+                             stats.applied, stats.skipped_host_path, stats.pluto_converted);
                 if (stats.pluto_failed) {
                     std::fprintf(stderr,
                                  "[runtime] sysload %s: %zu official Pluto table(s) could not "
                                  "be converted (kept as raw bytes)\n",
-                                 path.c_str(), stats.pluto_failed);
+                                 legacy.c_str(), stats.pluto_failed);
                 }
                 if (!off.read_lines.empty()) {
                     // 引擎目前没有"已读行"状态存储（skip 不做已读判定），所以
@@ -160,58 +208,35 @@ void GameRuntime::RuntimeState::sysload() {
                                  "[runtime] sysload %s: %zu script(s) / %zu read-line(s) in "
                                  "the official progress table (not applied: the engine keeps "
                                  "no read state)\n",
-                                 path.c_str(), off.read_lines.size(), stats.read_lines);
+                                 legacy.c_str(), off.read_lines.size(), stats.read_lines);
                 }
             } catch (const std::exception& e) {
                 std::fprintf(stderr, "[runtime] sysload official decode %s failed: %s\n",
-                             path.c_str(), e.what());
+                             legacy.c_str(), e.what());
             }
             continue;
         }
-        try {
-            const auto map = oa::runtime::decode_domain_map(doc);
-            const std::string prefix = is_global ? "g." : "s.";
-            for (const auto& [k, v] : map) {
-                interpreter_->set_variable(prefix + k, v);
-            }
-            std::fprintf(stderr, "[runtime] sysload %s (%zu entries)\n", path.c_str(),
-                         map.size());
-        } catch (const std::exception& e) {
-            std::fprintf(stderr, "[runtime] sysload decode %s failed: %s\n", path.c_str(),
-                         e.what());
+        // 旧版本引擎写的 OASB（占据着这个文件名）不去动它：OASB 容器同时是
+        // 本引擎 `pluto.persist` 的载体，仅凭魔数**分不出**"引擎的域文档"和
+        // "游戏自己写的 sys 表"——搬错一边就是删玩家数据。旧域文档不导入，
+        // 下一次 syssave 会用 *.oa.dat 重新建立；游戏的文件原样留在原地。
+        if (is_oasb_document(doc)) {
+            std::fprintf(stderr,
+                         "[runtime] sysload: %s is an OASB document from an older build; "
+                         "left untouched (the engine now writes %s)\n",
+                         legacy.c_str(), oa_path.c_str());
+            continue;
         }
     }
 }
 
-namespace {
-
-/// 覆盖前保住官方原件：如果目标位置现在是 BOW* 容器（玩家从原生引擎搬来的
-/// 档），第一次覆盖前把原字节另存为 `<file>.official.bak`。官方引擎还能读回
-/// 那一份，我们也不会"读进来就把它抹掉"。备份失败不阻止写入（否则玩家存不
-/// 了档），但一定留日志。
-void preserve_official_original(oa::runtime::SaveStore& store, const std::string& path) {
-    const auto existing = store.read(path);
-    if (!existing) return;
-    const std::string doc(existing->begin(), existing->end());
-    if (!oa::runtime::is_official_save(doc)) return;
-    const std::string backup = path + ".official.bak";
-    if (store.read(backup)) return; // 已经备份过（只保第一份原件）
-    if (store.write(backup, *existing)) {
-        std::fprintf(stderr,
-                     "[runtime] syssave: kept the original official save as %s before the "
-                     "first overwrite\n",
-                     backup.c_str());
-    } else {
-        std::fprintf(stderr,
-                     "[runtime] syssave: could NOT back up the official save at %s; the "
-                     "overwrite destroys it (save still proceeds)\n",
-                     path.c_str());
-    }
-}
-
-} // namespace
-
 bool GameRuntime::RuntimeState::syssave() {
+    // 契约（重构后）：system.dat / saveg.dat 归游戏与官方引擎，本引擎一个字节都不写。
+    //
+    // 引擎只把自己的 g./s. 域写进 system.oa.dat / saveg.oa.dat。
+    // 游戏自己的 sys 表 / gscr（conf.dat、global.dat）由游戏的 system_save() 写；
+    // 数据里 `[system_save]` 总是排在 `[save]` 前面，所以这里**不要**再调一次
+    // 游戏的落盘函数——那会重复弹通知、重复写盘。
     if (!save_.save_store_ || !interpreter_) return false;
     const auto& vars = interpreter_->variables();
     const std::map<std::string, oa::runtime::Value> global(vars.global.begin(),
@@ -223,7 +248,6 @@ bool GameRuntime::RuntimeState::syssave() {
                                                                 oa::runtime::Value>& m) {
         const std::string path = qualify_save_file(file);
         if (path.empty()) return;
-        preserve_official_original(*save_.save_store_, path);
         // Strip the domain prefix off each key.
         std::map<std::string, oa::runtime::Value> stripped;
         for (const auto& [k, v] : m) {
@@ -233,8 +257,8 @@ bool GameRuntime::RuntimeState::syssave() {
         const std::vector<uint8_t> bytes(doc.begin(), doc.end());
         if (!save_.save_store_->write(path, bytes)) all_ok = false;
     };
-    write_map(kSavegFile, global);
-    write_map(kSystemFile, system);
+    write_map(kSavegOaFile, global);
+    write_map(kSystemOaFile, system);
     return all_ok;
 }
 
@@ -270,20 +294,76 @@ bool legacy_reserved_file(const std::string& file) {
 /// Flatten a message layer's page into the one string the engine can re-issue:
 /// Text/RubyBase units keep their bytes, a Newline unit becomes '\n' (push_text
 /// splits it back into the same unit sequence).
-void collect_text_snapshot(oa::runtime::SaveData* data, const oa::render::TextEngine& text) {
+namespace {
+
+// 框架的 CSV 按钮页（存档/读档/设置/回想）：根 id 是纯数字（500/600/700…），
+// 子树里带 csvbtn 生成的 `name=` 点击行。这些页面是**打开着的操作界面**，
+// 不属于剧情状态。存档时把它们的层一起存下来，读档后没人会关掉（框架的
+// `restore` 只按 `scr.uifunc` 关 UI，而存档时它已经是 nil），于是整页按钮、
+// 槽位编号和时间会盖在剧情画面上——用户报的"读档以后有文字残留"。
+// 剧情层的根 id 一般带点（1.80 / 10.0），不会被这条规则误伤。
+//
+// **画面根 "1" 不是页面根**：Artemis 的整幅画面（背景/立绘/消息窗）都挂在
+// 顶层 id "1" 下（框架自己就是 `[lydel id="1"]` 清画面，见 alldelete /
+// adv_reset）。而 1.80 消息窗的按钮也是 csvbtn 生成的 `name=` 点击行，于是
+// "1" 的子树里同样"有点击行带 name"——只按这条判据，整个 "1" 会被当成 CSV
+// 页面，存档里的背景/立绘全部消失（用户报的"存档读档后背景丢失"）。
+// 页面根只会是 400/500/600/700 这类旁挂的顶层数字 id，画面根永远是 "1"。
+constexpr const char* kSceneRootId = "1";
+
+bool is_csv_button_page_root(const oa::render::Compositor& scene, const std::string& id) {
+    if (id.empty() || id.find('.') != std::string::npos) return false;
+    if (id == kSceneRootId) return false;
+    for (char c : id)
+        if (c < '0' || c > '9') return false;
+    const std::string prefix = id + ".";
+    for (const oa::render::Layer* l : scene.draw_order()) {
+        if (l->id.rfind(prefix, 0) != 0) continue;
+        const auto it = l->event_handlers.find("click");
+        if (it == l->event_handlers.end()) continue;
+        // 两种按钮工厂的签名：
+        //   name=<命令>        —— iMel/FPM 的 csvbtn
+        //   com=<按钮名>       —— Artemis 系的 csvbtn2（save/load 页的
+        //                          `com=bt_save01` / `com=sys_ret`）
+        // 只认 name 的话，Artemis 的存档页会被当成剧情层整页存进存档，
+        // 读档后存档界面的日期/槽位文字盖在画面上（test13）。
+        if (it->second.params.count("name") || it->second.params.count("com")) return true;
+    }
+    return false;
+}
+
+// 子树里的任意一层是否落在"操作界面"根上。
+bool under_csv_button_page(const oa::render::Compositor& scene, const std::string& id) {
+    std::string cur = id;
+    while (true) {
+        if (is_csv_button_page_root(scene, cur)) return true;
+        const auto dot = cur.rfind('.');
+        if (dot == std::string::npos) return false;
+        cur = cur.substr(0, dot);
+    }
+}
+
+} // namespace
+
+void collect_text_snapshot(oa::runtime::SaveData* data, const oa::render::TextEngine& text,
+                           const oa::render::Compositor& scene) {
     data->has_text = true;
     const std::string active = text.active_layer_id();
-    for (const auto& [id, ml] : text.layers()) {
-        // A layer whose scene node is gone ([lydel]) must not come back as a
-        // phantom page after a load. text_hidden alone is the framework's
-        // [sceout] and DOES get saved: the story page is hidden while a UI
-        // screen is open, and that page is exactly what has to return.
-        if (ml.scene_gone) continue;
+    for (const auto& [id, mlp] : text.all_layers()) {
+        const oa::render::MessageLayer& ml = *mlp;
+        // 文本内容就存在节点上：节点没了 = 内容没了（[lydel] 之后不会有
+        // 幽灵页）。
+        if (scene.find(id) == nullptr) continue;
+        // 操作界面（csvbtn 预建的 500.bt.N.bg.M 一类的槽位文字）不是画面
+        // 上的东西：它们的排版参数是待用的，读档时 ensure_message_scene_node
+        // 会把它们复活成可见 —— 那就是"读档后存档页的编号留在了剧情上"。
+        if (under_csv_button_page(scene, id)) continue;
         std::string flat;
         for (const auto& u : ml.page) {
             if (u.kind == oa::render::PageUnit::Kind::Newline) flat.push_back('\n');
             else flat += u.data;
         }
+        // 没有内容、又没有绘制盒的层（框架预建的槽位排版记录）不存。
         if (flat.empty() && !ml.positioned) continue;
         oa::runtime::TextLayerSnap s;
         s.id = id;
@@ -295,7 +375,7 @@ void collect_text_snapshot(oa::runtime::SaveData* data, const oa::render::TextEn
         s.height = ml.height;
         s.font = ml.font.raw;
         s.text = std::move(flat);
-        s.revealed = !ml.reveal_pending && ml.reveal_index >= ml.char_count;
+        s.revealed = ml.done;
         data->text_layers.push_back(std::move(s));
     }
 }
@@ -319,13 +399,17 @@ void restore_text_snapshot(oa::render::TextEngine* text, oa::render::Compositor*
         }
         text->switch_layer(s.id, /*stack=*/false, std::nullopt);
         if (!font.empty()) text->apply_font(font);
-        if (!s.text.empty()) text->push_text(s.text);
+        if (!s.text.empty()) {
+            text->push_text(s.text);
+            // 恢复出来的这页是"存档时的样子"。框架的恢复流程随后会把当前页
+            // 原样重打一遍（restoreText → mw_redraw → message_control），
+            // push_text 是追加语义 —— 不拦一下就变成同一句出现两次。
+            text->arm_reload_replace(s.id);
+        }
         if (s.revealed) text->reveal_all();
         const oa::render::MessageLayer* ml = text->layer(s.id);
         const bool layered = ml && ml->layered;
         const std::string scene_id = scene->ensure_message_scene_node(s.id, layered);
-        scene->set_message_layer_binding(s.id, scene_id);
-        scene->revive_message_layer(s.id);
         if (s.active) active = s.id;
     }
     if (!active.empty()) {
@@ -339,7 +423,7 @@ void collect_scene_snapshot(oa::runtime::SaveData* data, const oa::render::Compo
     const oa::render::Layer& root = scene.root_props();
     data->root_props = root.props;
     for (const oa::render::Layer* l : scene.draw_order()) {
-        if (scene.is_message_slot(l->id)) continue; // 槽=运行时结构,文本流重建
+        if (under_csv_button_page(scene, l->id)) continue; // 打开中的操作界面不存
         oa::runtime::LayerSnap snap;
         snap.id = l->id;
         snap.props = l->props;
@@ -497,16 +581,30 @@ bool GameRuntime::RuntimeState::save_game_to(const std::string& file) {
 
     oa::runtime::SaveData data;
     data.local_variables = interpreter_->variables().local;
-    if (const std::string* s = interpreter_->current_script()) {
-        data.current_script = *s;
-    }
-    data.current_line = interpreter_->current_line();
-    for (const auto& f : interpreter_->call_stack()) {
-        data.call_stack.emplace_back(f.script, f.return_line);
+    // 恢复点 = 剧情位置，不是"此刻正在跑的那一条"。
+    //
+    // `[save]` 是排队执行的，落到这里时脚本几乎总在框架脚本里
+    // （`adv_save` → `save_write` → `[save]`，中间还有 `attack_check`）。
+    // 存当前位置 = 存了一个宏体的中间行：读档后从宏中间接着跑，剧情接不上
+    // （test13 读档后卡在 ui.asb 的 `[stop]`，点什么都没反应）。
+    // 只有当前位置**在框架脚本里**时才改用"最近一次最外层停驻"的位置；
+    // 剧情脚本里的存档（T3/绝大多数游戏）照旧存当前位置 + 调用栈。
+    const std::string* cur = interpreter_->current_script();
+    const bool in_framework_script =
+        cur && (cur->rfind("system/", 0) == 0 || cur->find("/system/") != std::string::npos);
+    if (in_framework_script && !interpreter_->stable_script().empty()) {
+        data.current_script = interpreter_->stable_script();
+        data.current_line = interpreter_->stable_line();
+    } else {
+        if (cur) data.current_script = *cur;
+        data.current_line = interpreter_->current_line();
+        for (const auto& f : interpreter_->call_stack()) {
+            data.call_stack.emplace_back(f.script, f.return_line);
+        }
     }
     collect_scene_snapshot(&data, scene());
     collect_audio_snapshot(&data, media_.audio_);
-    collect_text_snapshot(&data, text());
+    collect_text_snapshot(&data, text(), scene());
     const std::string doc = data.encode();
     const std::string path = qualify_save_file(file);
     if (path.empty()) {
@@ -520,14 +618,8 @@ bool GameRuntime::RuntimeState::save_game_to(const std::string& file) {
     std::fprintf(stderr, "[runtime] saved %s (%zu local vars, script %s:%zu)\n",
                  path.c_str(), data.local_variables.size(), data.current_script.c_str(),
                  data.current_line);
-    // A numbered save refreshes the system save too.
-    (void)syssave();
-    // The save screen closes through ui_return, which re-opens the screen and
-    // hands control back in the middle of the UI script. Give the runtime a
-    // window to put the reader back on the page once the screen is really
-    // gone (see settle_ui_session_park).
-    save_ui_recovery_ = true;
-    save_ui_recovery_frames_ = 900;
+    // 系统数据不再由引擎补写：onSave 处理器（iMel: store()）自己决定要落什么
+    // （scr/log/qjb 进存档，sys/gscr 走 system_save）。引擎再补一次只会多写一遍。
     return true;
 }
 
@@ -554,16 +646,14 @@ size_t GameRuntime::RuntimeState::reset_ephemeral_on_load() {
     drop_pending_tween_cancels(); clr();
     transition().clear(); clr();
     pointer_.hovered_.clear(); pointer_.drag_layer_.clear(); clr();
-    inline_event_frame_.reset(); clr();
-    park_suspensions_.clear(); clr();
+    reset_park_contexts(); clr();
     save_.screenshot_.valid = false; clr();
-    save_.capture_pending_ = false; clr();
     renderer_.stop_all_delete();
-    wait_.reset(); clr();
-    parked_tail_.clear(); clr();
-    pending_parks_.clear(); clr();
-    pending_custom_.clear(); clr();
-    pending_sync_tweens_.clear(); clr();
+    park_.wait.reset(); clr();
+    park_.tail.clear(); clr();
+    park_.pending.clear(); clr();
+    park_.pending_custom.clear(); clr();
+    park_.pending_sync_tweens.clear(); clr();
     save_.autosaved_current_wait_ = false;
     save_.autosave_last_seq_ = 0;
 
@@ -796,6 +886,19 @@ LoadResult GameRuntime::RuntimeState::load_game(const std::string& file, int64_t
     // onLoad (restore): unpack restored variables back into the Lua tables.
     // FPM handler `restore(e, p)` reads p.file too (fileio.lua:12) — same
     // calllua shape as onSave.
+    // 丢掉上一次会话残留的 estag 队列（`scr.est`）：它是框架"正在进行的
+    // UI/动画流程"的执行栈，不属于存档内容。留着它，读档后玩家第一次点击就会
+    // 让 estag_call 弹出旧的 dialog_return / uitrans —— 而 restore 里的
+    // adv_flagreset() 已经把 flg 清成 {}，于是一头撞上 `flg.dlg == nil`
+    // （test2: estag_call ... attempt to index local 'dlgp' (a nil value)），
+    // 异常吞掉这一拍，表现就是"点了不动"。放在 restore 之前清，让框架自己
+    // 重建需要的那一层。
+    try {
+        interpreter_->lua_bridge().run_code(
+            "if type(scr) == \"table\" then scr.est = nil end\n", "load_drop_estag");
+    } catch (const std::exception&) {
+        // 没有 scr 的框架（iMel）本来就没事。
+    }
     {
         const std::map<std::string, std::string> onload_params{{"file", file}};
         // research/130: same policy as onSave above.
@@ -854,22 +957,6 @@ LoadResult GameRuntime::RuntimeState::load_game(const std::string& file, int64_t
                      "[runtime] load: %zu malformed and %zu duplicate layer snapshot(s) "
                      "were skipped (explicit handling; no ghost nodes)\n",
                      rst.skipped_invalid, rst.skipped_dup);
-    }
-    // Same window as a save: the load screen unwinds through the UI script.
-    save_ui_recovery_ = true;
-    save_ui_recovery_frames_ = 900;
-    // The saved position is the UI screen's own (the save was taken from
-    // inside it); the outermost non-system call frame is the story page the
-    // reader has to land on when that screen closes.
-    loaded_story_frame_valid_ = false;
-    for (const auto& f : data.call_stack) {
-        if (f.first.compare(0, 7, "system/") != 0 &&
-            f.first.compare(0, 9, "scenario/") == 0) {
-            loaded_story_frame_valid_ = true;
-            loaded_story_script_ = f.first;
-            loaded_story_line_ = f.second;
-            break;
-        }
     }
     return LoadResult::Ok;
 }
@@ -962,9 +1049,11 @@ void GameRuntime::RuntimeState::handle_save_tag(const oa::runtime::Event& e) {
         return;
     }
     if (e.tag == "takess") {
-        // [takess]: the host snapshots the frame it is about to present.
-        save_.screenshot_.valid = false;
-        save_.capture_pending_ = save_.capture_fn_ != nullptr;
+        // [takess]：把玩家此刻看到的画面存下来给缩略图用。
+        //
+        // 直接读渲染器的 stage 内容 —— 那就是**上一帧已经呈现出来**的画面，
+        // 也正是玩家看到的画面。不需要"记 pending、等本帧画完再抓"。
+        capture_screenshot();
         return;
     }
     if (e.tag == "savess") {
@@ -1051,9 +1140,9 @@ std::vector<uint8_t> resize_rgba(const uint8_t* src, uint32_t sw, uint32_t sh,
 }
 } // namespace
 
-void GameRuntime::RuntimeState::post_frame_capture() {
-    if (!save_.capture_pending_ || !save_.capture_fn_) return;
-    save_.capture_pending_ = false;
+void GameRuntime::RuntimeState::capture_screenshot() {
+    save_.screenshot_.valid = false;
+    if (!save_.capture_fn_) return;
     uint32_t w = 0, h = 0;
     if (auto rgba = save_.capture_fn_(&w, &h)) {
         save_.screenshot_.valid = !rgba->empty() && w > 0 && h > 0 &&
@@ -1110,19 +1199,26 @@ void GameRuntime::RuntimeState::handle_save_screenshot(const std::string& file, 
     if (png.empty()) return;
     const std::string path = qualify_save_file(name);
     if (path.empty() || !save_.save_store_) return;
-    (void)save_.save_store_->write(path, png);
+    if (!save_.save_store_->write(path, png)) return;
+    // 缩略图是**原地覆盖**写的（同名文件换内容）：层按文件名缓存贴图，覆盖后
+    // 框架重建缩略图层也会命中旧图。让渲染器按新文件重新上传（层 file 键不带
+    // 扩展名）。
+    std::string asset = path;
+    if (asset.size() > 4 && asset.rfind(".png") == asset.size() - 4)
+        asset.resize(asset.size() - 4);
+    renderer_.forget_asset(asset);
 }
 
 void GameRuntime::RuntimeState::maybe_autosave_for_wait() {
     // Park identity is a monotonic sequence, not a value signature: two
     // consecutive pages ending in an identical [click]/[@] are distinct parks
     // and must each get their autosave.
-    const uint64_t seq = wait_ ? wait_->seq : 0;
+    const uint64_t seq = park_.wait ? park_.wait->seq : 0;
     if (seq != save_.autosave_last_seq_) {
         save_.autosave_last_seq_ = seq;
         save_.autosaved_current_wait_ = false;
     }
-    if (save_.autosave_allow_ == 2 && is_input_wait(wait_ ? &*wait_ : nullptr) &&
+    if (save_.autosave_allow_ == 2 && is_input_wait(park_.wait ? &*park_.wait : nullptr) &&
         !save_.autosaved_current_wait_ && save_.save_store_ && save_.save_store_->persistent()) {
         save_.autosaved_current_wait_ = true;
         (void)save_game_to(kAutosaveFile);

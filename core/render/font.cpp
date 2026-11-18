@@ -630,35 +630,41 @@ size_t FontSystem::draw_text_layer(oa::render::RenderBackend* backend,
             const oa::render::FPoint down{ float(x2), float(y2) };
             backend->draw_texture_affine(tex, nullptr, origin, right, down);
         };
+    // 字形只带"页内下标"，字体在**当前页**上解析 —— 排版缓存可以跨帧、
+    // 跨读档复用，而页会重建；存指针必然悬垂。
+    auto font_of = [&](const oa::render::LaidGlyph& g) -> const oa::render::FontDesc* {
+        return g.unit < ml.page.size() ? &ml.page[g.unit].font : nullptr;
+    };
     for (const oa::render::LaidGlyph& g : page.glyphs) {
-        if (g.newline || !g.font) continue;
+        const oa::render::FontDesc* gf = font_of(g);
+        if (g.newline || !gf) continue;
         // Only revealed glyphs draw.
-        if (g.order >= ml.reveal_index) continue;
-        const double gsize = g.font->size();
+        if (g.order >= ml.shown) continue;
+        const double gsize = gf->size();
         // 栅格/落点按比例语义（ppem=round(size·upem/H)，见 measure_glyph）。
-        const GlyphMeasure gm = measure_glyph(*g.font, g.cp);
-        const CachedGlyph cg = glyph_slot(backend, face_for(*g.font), gsize, g.cp);
+        const GlyphMeasure gm = measure_glyph(*gf, g.cp);
+        const CachedGlyph cg = glyph_slot(backend, face_for(*gf), gsize, g.cp);
         if (!cg.tex) continue;
         // x = layout x + left bearing; y = content top + ascent − bitmap top.
         const double lx = ml.left + g.x + double(cg.bitmap_left);
         const double ly = line_content_top + double(g.line) * line_h +
             gm.ascent - double(cg.bitmap_top);
-        const oa::render::Rgba col = text_color(*g.font);
+        const oa::render::Rgba col = text_color(*gf);
         oa::render::Rgba shadow{ 0, 0, 0, 0 };
         oa::render::Rgba outline{ 0, 0, 0, 0 };
-        style_colors(*g.font, &shadow, &outline);
+        style_colors(*gf, &shadow, &outline);
         // Two generations coexist: style words (FPM) or numeric outline/shadow
         // keys (iMel). Numeric outline needs an explicit parseable colour.
-        const bool style_outline = style_word_on(*g.font, "outline");
-        const bool style_shadow = style_word_on(*g.font, "shadow");
+        const bool style_outline = style_word_on(*gf, "outline");
+        const bool style_shadow = style_word_on(*gf, "shadow");
         double ow_key = 0, sd_key = 0;
-        const bool num_outline_key = numeric_edge_amount(*g.font, "outline", &ow_key);
+        const bool num_outline_key = numeric_edge_amount(*gf, "outline", &ow_key);
         bool num_outline = num_outline_key;
         if (num_outline) {
-            const std::string* oc = g.font->get("outlinecolor");
+            const std::string* oc = gf->get("outlinecolor");
             if (!oc || !parse_rgb(*oc)) num_outline = false;
         }
-        const bool num_shadow = numeric_edge_amount(*g.font, "shadow", &sd_key);
+        const bool num_shadow = numeric_edge_amount(*gf, "shadow", &sd_key);
         const bool has_shadow = style_shadow || num_shadow;
         const bool has_outline = style_outline || num_outline;
         // Stroke width: numeric value, else 1px (style path).
@@ -680,7 +686,7 @@ size_t FontSystem::draw_text_layer(oa::render::RenderBackend* backend,
                     emit_pass(o[0] * os, o[1] * os, outline, 255);
             } else {
                 const CachedGlyph eg =
-                    edge_slot(backend, face_for(*g.font), gsize, g.cp, os);
+                    edge_slot(backend, face_for(*gf), gsize, g.cp, os);
                 if (eg.tex) {
                     // Same origin grid as the fill → same landing formula.
                     const double ex = ml.left + g.x + double(eg.bitmap_left);

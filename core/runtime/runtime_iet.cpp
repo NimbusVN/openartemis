@@ -1650,10 +1650,63 @@ void Interpreter::restore_position(const std::string& script, size_t line,
     }
     current_line_ = line;
     call_stack_ = stack;
+    stable_script_ = script;
+    stable_line_ = line;
+    queue_stack_.clear(); // 帧被整体替换，旧的每层队列不再有意义
     arrived_by_jump_ = false;
     last_wait_from_queue_ = false;
-    queue_hold_depth_ = 0;
     macro_param_saves_.clear();
+}
+
+bool Interpreter::begin_handler_frame() {
+    if (!current_script_name_) return false;
+    if (in_handler_frame()) return false; // 嵌套派发由外层会话负责
+    // 会话帧是 ReturnStack 的把手，不是执行上下文的边界：它共享当前这一层
+    // 的停驻（处理函数是同层回调，不是从脚本位置发起的调用），所以不通知
+    // 宿主压上下文。
+    call_stack_.push_back(
+        CallFrame{*current_script_name_, current_line_, 0, /*synthetic=*/true});
+    return true;
+}
+
+void Interpreter::end_handler_frame() {
+    if (in_handler_frame()) call_stack_.pop_back();
+}
+
+bool Interpreter::handler_return_now() {
+    // 最内层的合成帧就是这次会话的入口；它上面的一切（处理函数里 [call] 压的
+    // 帧）都属于这次会话，一起收掉，光标回到会话入口。
+    size_t idx = call_stack_.size();
+    for (size_t i = call_stack_.size(); i-- > 0;) {
+        if (call_stack_[i].synthetic) { idx = i; break; }
+    }
+    if (idx == call_stack_.size()) {
+        // 没有会话帧：这是 Lua `tags.<tag>` 处理器里的 `ReturnStack()`
+        // （test13 的 `load_broken save`）。原版 e:tag{"return"} 在这里就是
+        // **立即**弹一帧；排队执行的话，同一个处理器随后排的
+        // `[call ui.asb return_ui]` 会把回程点记在当前（UI）脚本上 ——
+        // 收尾链于是停死在 `ui.asb` 的 `[stop]`，玩家看到"存档后点不动"。
+        if (!in_lua_tag_handler_ || call_stack_.empty()) return false;
+        const CallFrame frame = call_stack_.back();
+        call_stack_.pop_back();
+        restore_frame_queue();
+        restore_macro_params(call_stack_.size() + 1);
+        if (hooks_.frame_popped) (void)hooks_.frame_popped();
+        current_script_name_ = frame.script;
+        current_line_ = frame.return_line;
+        return true;
+    }
+    while (call_stack_.size() > idx + 1) {
+        call_stack_.pop_back();
+        restore_frame_queue();
+        restore_macro_params(call_stack_.size() + 1);
+        if (hooks_.frame_popped) (void)hooks_.frame_popped();
+    }
+    const CallFrame entry = call_stack_.back();
+    call_stack_.pop_back();
+    current_script_name_ = entry.script;
+    current_line_ = entry.return_line;
+    return true;
 }
 
 void Interpreter::start(const std::string& script, std::string_view label) {
@@ -1668,8 +1721,10 @@ void Interpreter::start(const std::string& script, std::string_view label) {
     current_script_name_ = script;
     current_line_ = *line;
     call_stack_.clear();
+    queue_stack_.clear();
     arrived_by_jump_ = false;
-    queue_hold_depth_ = 0;
+    stable_script_ = script;
+    stable_line_ = *line;
     macro_param_saves_.clear();
 }
 
@@ -1690,7 +1745,10 @@ void Interpreter::boot(const std::string& script) {
     current_line_ = line.value_or(0);
     call_stack_.clear();
     arrived_by_jump_ = false;
-    queue_hold_depth_ = 0;
+    stable_script_ = script;
+    stable_line_ = line.value_or(0);
+    // 重新引导 = 上一局的挂起停驻作废（它指向的影片/转场已经不在了）。
+    pending_immediate_park_.reset();
     macro_param_saves_.clear();
 }
 
@@ -1780,6 +1838,7 @@ void Interpreter::enqueue_tag(std::string tag, std::map<std::string, std::string
     ins.tag = std::move(tag);
     ins.params = std::move(params);
     ins.line = 0;
+    if (in_handler_frame()) ins.floor_depth = logical_depth();
     if (current_script_name_) ins.origin_script = *current_script_name_;
     tag_queue_.push_back(std::move(ins));
 }
@@ -1907,6 +1966,11 @@ static TagOutcome execute_tag(Interpreter& it, const Instruction& ins, bool appl
                 filter_params[k] = v;
             }
             oa::runtime::FilterDecision d = oa::runtime::FilterDecision::Missing;
+            struct TagHandlerScope {
+                Interpreter& it;
+                explicit TagHandlerScope(Interpreter& i) : it(i) { it.enter_lua_tag_handler(); }
+                ~TagHandlerScope() { it.leave_lua_tag_handler(); }
+            } tag_handler_scope(it);
             try {
                 d = it.lua_bridge().run_tag_filter(tag, filter_params);
             } catch (const oa::runtime::LuaError& e) {
@@ -2339,6 +2403,7 @@ static TagOutcome execute_tag(Interpreter& it, const Instruction& ins, bool appl
             return out;
         }
         if (tag == "print") {
+            it.note_page_printed();
             const std::string raw = resolve_or_empty("data");
             std::string text = raw;
             if (!raw.empty() && raw.front() == '$') {
@@ -2548,21 +2613,24 @@ static TagOutcome execute_tag(Interpreter& it, const Instruction& ins, bool appl
 
 bool Interpreter::run_tag_now(const std::string& tag,
                               std::map<std::string, std::string> params) {
-    // Presentation-only whitelist. `e:tag` in Artemis runs the tag immediately;
-    // `e:enqueueTag` defers. Both used to push onto the same FIFO, so a macro's
-    // freshly built layers were applied AFTER tags the caller had queued
-    // earlier (slider_h's rebuild ran after the CSV [lyprop id="100.101"
-    // left=...] and reset the slider to the origin).
-    static const std::set<std::string> kNow = {
-        "lyc", "lyc2", "lydel", "lyprop", "lycolor", "lyevent",
-        "lytween", "lytweendel", "tweenset", "/tweenset",
-        "font", "fontinit", "fontdefault", "font_close", "/font",
-        "ruby", "/ruby", "print", "rt", "rp",
-        "chgmsg", "/chgmsg", "chgmsg_close",
-        "flip", "lyshader", "tximg",
+    // Artemis 的 `e:tag` 是当场执行，`e:enqueueTag` 才排队
+    // 所以判据用**黑名单**：只有语义上必须由主循环拥有的 tag 才拒绝立即执行 ——
+    //   改执行位置：jump / goto / call / return
+    //   建立停驻：  stop / wt / wt0 / click / wait / exkey / @
+    //   宿主裁决：  trigger
+    //   演出转场：  trans（宿主在事件里建立 Stop{trans}）
+    // 其余一切（层、文本、补间配置、字体、变量…）当场跑完。
+    //
+    // 旧实现是白名单：没列进去的一律排队。于是
+    //     chgmsg（在名单）立即 → scetween（不在）排队 → /chgmsg（在）立即
+    // 补间被排到了消息层关闭之后，玩家看到的是"每次调速，速度还是上一次的"。
+    // 白名单还会漏掉框架新增的任何 tag，与"立即执行"的契约正好相反。
+    static const std::set<std::string> kDeferred = {
+        "jump", "goto", "call", "return",
+        "stop", "wt", "wt0", "click", "wait", "exkey", "@", "trigger",
+        "trans",
     };
-    if (!hooks_.immediate_tags) return false;
-    if (!kNow.count(tag)) return false;
+    if (kDeferred.count(tag)) return false;
     if (immediate_tag_depth_ >= 8) return false; // re-entrancy guard
     Instruction ins;
     ins.tag = tag;
@@ -2583,9 +2651,17 @@ bool Interpreter::run_tag_now(const std::string& tag,
         case TagOutcomeKind::Continue:
             return true;
         case TagOutcomeKind::WaitEvent:
-        case TagOutcomeKind::CustomEvent:
-            if (callback_) (void)callback_(outcome.event);
+        case TagOutcomeKind::CustomEvent: {
+            const CallbackResult cr =
+                callback_ ? callback_(outcome.event) : CallbackResult::Continue;
+            if (cr == CallbackResult::Pause && run_depth_ > 0) {
+                // 宿主（GameRuntime）说"这里要停"：全屏 [video] 就是这种。
+                // 立即执行不等于跳过停驻 —— 原版 Command 在脚本流里同样会
+                // 把状态置成等待。
+                pending_immediate_park_ = outcome.event;
+            }
             return true;
+        }
         default:
             // Redirecting outcomes (jump/call/return/wait) must be owned by
             // the main loop; let the caller queue the tag.
@@ -2612,11 +2688,30 @@ bool Interpreter::dispatch_text_row_to_print_filter(const std::string& text) {
     return d == oa::runtime::FilterDecision::Consume;
 }
 
+std::optional<ExecutionResult> Interpreter::take_immediate_park() {
+    if (!pending_immediate_park_) return std::nullopt;
+    Event ev = std::move(*pending_immediate_park_);
+    pending_immediate_park_.reset();
+    last_wait_from_queue_ = false;
+    note_wait_reason(ev);
+    last_wait_event_ = ev;
+    return ExecutionResult::Wait;
+}
+
 ExecutionResult Interpreter::run() {
+    // 立即执行的 tag 可能在更深的 Lua 调用里把停驻留下；深度用于区分
+    // "脚本流里的 e:tag"（要接住）和 "UI 回调里的 e:tag"（派发方自己处理）。
+    struct RunDepth {
+        int& d;
+        explicit RunDepth(int& v) : d(v) { ++d; }
+        ~RunDepth() { --d; }
+    } run_depth_guard(run_depth_);
     // 单次 run() 的 tag 预算（= 每帧最多推进多少条指令）。
     size_t budget = size_t(4096);
     for (;;) {
         if (budget-- == 0) return ExecutionResult::BudgetExhausted;
+        // 立即执行的 tag 要求停驻（全屏影片 / 转场）：先停，别继续跑下一行。
+        if (auto parked = take_immediate_park()) return *parked;
         // Drain tags queued by Lua (e:tag/e:enqueueTag) before inline steps.
         if (const auto wait_result = flush_tag_queue()) return *wait_result;
 
@@ -2668,7 +2763,7 @@ ExecutionResult Interpreter::run() {
                 continue;
             }
             if (cr == CallbackResult::Pause) {
-                parked_ = true;
+                note_stable_park();
                 return ExecutionResult::Wait;
             }
             throw ScriptError("aborted", "callback aborted", ins.line);
@@ -2727,6 +2822,8 @@ ExecutionResult Interpreter::run() {
                 }
                 call_stack_.push_back(
                     CallFrame{outcome.return_script, outcome.return_line, next_frame_id_++});
+                save_frame_queue();
+                if (hooks_.frame_pushed) hooks_.frame_pushed();
                 const std::string target_script = outcome.file.empty() ? *current_script_name_
                                                                        : outcome.file;
                 if (!outcome.file.empty()) load_external_script(target_script);
@@ -2742,16 +2839,12 @@ ExecutionResult Interpreter::run() {
                 continue;
             }
             case TagOutcomeKind::Return: {
-                if (return_floor_ != 0 && call_stack_.size() <= return_floor_) {
-                    // A macro's return burst must not unwind the real caller
-                    // chain (see set_return_floor): drop the extra [return]s.
-                    continue;
-                }
                 if (!call_stack_.empty()) {
                     const std::string origin_script =
                         current_script_name_ ? *current_script_name_ : "";
                     const CallFrame frame = call_stack_.back();
                     call_stack_.pop_back();
+                    restore_frame_queue();
                     restore_macro_params(call_stack_.size() + 1);
                     current_script_name_ = frame.script;
                     current_line_ = frame.return_line;
@@ -2759,11 +2852,28 @@ ExecutionResult Interpreter::run() {
                     // The host may have parked this frame's continuation (a UI
                     // session took the story park over). Restoring it ends the
                     // step here; the restored wait owns the next input.
-                    if (frame.id && hooks_.frame_popped && hooks_.frame_popped(frame.id))
+                    if (hooks_.frame_popped && hooks_.frame_popped())
                         return ExecutionResult::ParkRestored;
                     continue;
                 }
-                // [return] with an empty stack ENDS the script (the pre-fix
+                // [return] with an empty stack ENDS the script. 这几乎总是
+                // 流程失衡（宏的 [return] 比 [call] 多一条），而它表现为
+                // "游戏不动了"——光标停在这一行、没有停驻。留一条日志，
+                // 免得下次只能靠 OA_STACKDBG 猜（NekoMiko 进 config 卡死
+                // 就是这条路径：popfuncNN 的 [return] 落在空栈上）。
+                {
+                    static std::string last_pos;
+                    const std::string pos =
+                        (current_script_name_ ? *current_script_name_ : "-") + ":" +
+                        std::to_string(current_line_);
+                    if (pos != last_pos) {
+                        last_pos = pos;
+                        std::fprintf(stderr,
+                                     "[runtime] [return] with an empty call stack at %s "
+                                     "(script ends; the flow is unbalanced)\n",
+                                     pos.c_str());
+                    }
+                }
                 return ExecutionResult::Completed;
             }
             case TagOutcomeKind::WaitEvent:
@@ -2779,7 +2889,7 @@ ExecutionResult Interpreter::run() {
                     // wait machine reads last_wait_event_ to classify the
                     // pause (Wait_ vs Trans vs media).
                     last_wait_event_ = outcome.event;
-                    parked_ = true;
+                    note_stable_park();
                     return ExecutionResult::Wait;
                 }
                 throw ScriptError("aborted", "callback aborted", ins.line);
@@ -2794,61 +2904,6 @@ ExecutionResult Interpreter::run() {
 
 // 按 Artemis 日期格式串渲染本地时间分量（ format_update_time）。
 // yyyy=四位年 / yy=两位年 / MM|dd|hh|mm|ss=补零 / M|d|h|m|s=不补零；其余原样。
-std::string format_update_time(const std::array<int64_t, 6>& c, const std::string& format) {
-    std::string out;
-    size_t i = 0;
-    const auto pad2 = [](int64_t v) {
-        char buf[4];
-        std::snprintf(buf, sizeof(buf), "%02lld", (long long)v);
-        return std::string(buf);
-    };
-    while (i < format.size()) {
-        const char ch = format[i];
-        size_t run = 1;
-        while (i + run < format.size() && format[i + run] == ch) ++run;
-        switch (ch) {
-            case 'y':
-                if (run >= 4) {
-                    char buf[8];
-                    std::snprintf(buf, sizeof(buf), "%04lld", (long long)c[0]);
-                    out += buf;
-                    i += run;
-                } else if (run >= 2) {
-                    out += pad2(c[0] % 100);
-                    i += run;
-                } else {
-                    out += ch;
-                    i += 1;
-                }
-                break;
-            case 'M':
-                out += (run >= 2) ? pad2(c[1]) : std::to_string(c[1]);
-                i += (run >= 2) ? run : 1;
-                break;
-            case 'd':
-                out += (run >= 2) ? pad2(c[2]) : std::to_string(c[2]);
-                i += (run >= 2) ? run : 1;
-                break;
-            case 'h':
-                out += (run >= 2) ? pad2(c[3]) : std::to_string(c[3]);
-                i += (run >= 2) ? run : 1;
-                break;
-            case 'm':
-                out += (run >= 2) ? pad2(c[4]) : std::to_string(c[4]);
-                i += (run >= 2) ? run : 1;
-                break;
-            case 's':
-                out += (run >= 2) ? pad2(c[5]) : std::to_string(c[5]);
-                i += (run >= 2) ? run : 1;
-                break;
-            default:
-                out += ch;
-                i += 1;
-                break;
-        }
-    }
-    return out;
-}
 
 Interpreter::Interpreter() : Interpreter(Config{}) {}
 
@@ -2917,9 +2972,6 @@ oa::runtime::LuaHost Interpreter::build_lua_host() {
         if (!hooks_.file_loader) return false;
         return hooks_.file_loader(resolved).has_value();
     };
-    host.save_root = [this]() -> std::string {
-        return hooks_.save_root ? hooks_.save_root() : std::string();
-    };
     host.run_tag_now = [this](const std::string& tag,
                               std::map<std::string, std::string> params) {
         return run_tag_now(tag, std::move(params));
@@ -2929,10 +2981,14 @@ oa::runtime::LuaHost Interpreter::build_lua_host() {
         variables_.set(name, std::move(v));
     };
     host.enqueue_tag = [this](std::string tag, std::map<std::string, std::string> params) {
+        if (std::getenv("OA_LOADDBG"))
+            std::fprintf(stderr, "[ld] enqueue %s (queue=%zu)\n", tag.c_str(),
+                         tag_queue_.size());
         Instruction ins;
         ins.tag = std::move(tag);
         ins.params = std::move(params);
         ins.line = 0;
+        if (in_handler_frame()) ins.floor_depth = logical_depth();
         if (current_script_name_) ins.origin_script = *current_script_name_;
         tag_queue_.push_back(std::move(ins));
     };
@@ -2976,22 +3032,37 @@ oa::runtime::LuaHost Interpreter::build_lua_host() {
     };
     host.get_script_status = [] { return 0; };
     host.set_script_status = [](int) {};
-    host.frame_number = [this] {
-        if (hooks_.frame_number) return hooks_.frame_number();
-        // No runtime behind (unit tests): project the interpreter clock.
+    // 帧号是宿主的时钟；没有宿主（单元测试）时按解释器时钟投影。
+    {
         const uint64_t fps = config_.fps > 0 ? uint64_t(config_.fps) : 60;
-        return now_ms() * fps / 1000;
-    };
+        host.frame_number = [this, fps] { return now_ms() * fps / 1000; };
+    }
     host.script_block = [this](const std::string& file, size_t index) {
         return script_block(file, index);
     };
     host.script_stack = [this] {
         std::vector<std::pair<std::string, size_t>> out;
         out.reserve(call_stack_.size() + 1);
-        for (const auto& frame : call_stack_) {
-            out.emplace_back(frame.script, frame.return_line);
+        const auto anonymous = [](const CallFrame& f) { return f.synthetic || f.anon; };
+        for (size_t i = 0; i < call_stack_.size(); ++i) {
+            const CallFrame& frame = call_stack_[i];
+            const bool top = i + 1 == call_stack_.size();
+            // 事件处理帧 / 排队 [jump] 压出来的回程帧对外都是空文件名：框架的
+            // ReturnStack()/ReturnStackAll() 靠 `file == ""` 认出"该收掉这一层
+            // UI"，并发 [return] 把它关掉。
+            out.emplace_back(anonymous(frame) ? std::string() : frame.script,
+                             top && anonymous(frame) ? current_line_ : frame.return_line);
         }
-        if (current_script_name_) out.emplace_back(*current_script_name_, current_line_);
+        // 栈顶是真实脚本位置时才追加一条；匿名帧已经代表"当前位置"，
+        // 再追加会把 "" 挤出栈顶（框架就认不出来了）。
+        if (current_script_name_ && !in_handler_frame() &&
+            (call_stack_.empty() || !anonymous(call_stack_.back())))
+            out.emplace_back(*current_script_name_, current_line_);
+        if (std::getenv("OA_STACKDBG")) {
+            std::fprintf(stderr, "[stack]");
+            for (const auto& [f, l] : out) std::fprintf(stderr, " %s@%zu", f.c_str(), l);
+            std::fprintf(stderr, "\n");
+        }
         return out;
     };
     host.get_wait_reason = [this] { return wait_reason_info_; };
@@ -3226,6 +3297,36 @@ bool Interpreter::apply_var(const std::map<std::string, std::string>& params) {
         }
         return true;
     }
+    // 宿主数据面（层属性 / 回放记录 / 消息层标签……）：解释器只负责把结果
+    // 写进变量域，数据归 runtime。参数按表达式解析后再交给宿主。
+    if (hooks_.system_var) {
+        std::map<std::string, std::string> resolved_params;
+        for (const auto& [k, v] : params) {
+            if (!v.empty() && v.front() == '$') {
+                try {
+                    resolved_params[k] = eval.resolve_param_str(v);
+                    continue;
+                } catch (const std::exception&) {
+                    // 表达式坏了就按原文交给宿主，由它决定回退值。
+                }
+            }
+            resolved_params[k] = v;
+        }
+        if (auto writes = hooks_.system_var(system, name, resolved_params)) {
+            for (const auto& [key, value] : *writes) variables_.set(key, value);
+            return true;
+        }
+    }
+    // 这三个查询的契约是"没有宿主数据就保守给 0"——形状（size 标量）属于
+    // e:var 协议，留在解释器；数据属于宿主。
+    if (system == "get_backlog_size") {
+        variables_.set(name, Value::make_int(0));
+        return true;
+    }
+    if (system == "get_backlog_tags" || system == "get_message_tags") {
+        variables_.set(name + ".size", Value::make_int(0));
+        return true;
+    }
     if (system == "unixtime") {
         variables_.set(name,
                        Value::make_int((long long)std::time(nullptr)));
@@ -3250,11 +3351,9 @@ bool Interpreter::apply_var(const std::map<std::string, std::string>& params) {
     if (system == "file_exist" || system == "file_exists") {
         const std::string file = eval.resolve_param_str(get("file"));
         bool exists = false;
-        if (get("save") == "1") {
-            // save=1: 存档数据（保存区相对路径；  save
-            // 分支，宿主按存档目录解析）。
-            if (hooks_.save_file_exists) exists = hooks_.save_file_exists(file);
-        } else if (hooks_.resource_exists) {
+        // save=1 的分支由宿主数据面（system_var）在入口接走：保存区不是工程
+        // 资源，不能拿 PFS 去探。
+        if (hooks_.resource_exists) {
             exists = hooks_.resource_exists(resolve_magic_path(file));
         } else if (hooks_.file_loader) {
             exists = hooks_.file_loader(resolve_magic_path(file)).has_value();
@@ -3262,150 +3361,14 @@ bool Interpreter::apply_var(const std::map<std::string, std::string>& params) {
         variables_.set(name, Value::make_bool(exists));
         return true;
     }
-    if (system == "file_update_time") {
-        // 存档文件更新时刻（文档 var/file_update_time.md）：file 按保存区
-        // 归一；format 缺省 yyyy/MM/dd hh:mm:ss；缺失落 noexist 原文。
-        const std::string file = eval.resolve_param_str(get("file"));
-        const std::string fmt = get("format");
-        const std::string noexist = get("noexist");
-        std::string value = noexist;
-        if (hooks_.file_mtime) {
-            if (auto c = hooks_.file_mtime(file)) {
-                value = format_update_time(*c, fmt.empty() ? "yyyy/MM/dd hh:mm:ss" : fmt);
-            }
-        }
-        variables_.set(name, Value::make_string(value));
-        return true;
-    }
-    if (system == "get_sound_info") {
-        // 声音播放状态（文档 var/get_sound_info.md；shape = 
-        // apply_sound_info, ）。
-        if (!hooks_.sound_info) {
-            variables_.set(name, Value::make_int(0)); // 无宿主钩子保守回退
-            return true;
-        }
-        const auto snap = hooks_.sound_info();
-        if (!snap) {
-            variables_.set(name, Value::make_int(0));
-            return true;
-        }
-        const std::string id = eval.resolve_param_str(get("id"));
-        if (!id.empty()) {
-            // 有 id：该 SE 的 playing/gain/pan；不存在仅 name.playing=0。
-            const auto it = std::find_if(snap->se.begin(), snap->se.end(),
-                                         [&](const auto& c) { return c.id == id; });
-            if (it != snap->se.end()) {
-                variables_.set(name + ".playing", Value::make_int(it->playing ? 1 : 0));
-                variables_.set(name + ".gain", Value::make_int(it->gain));
-                variables_.set(name + ".pan", Value::make_int(it->pan));
-            } else {
-                variables_.set(name + ".playing", Value::make_int(0));
-            }
-            return true;
-        }
-        const int64_t playing = snap->bgm && snap->bgm->playing ? 1 : 0;
-        const int64_t gain = snap->bgm ? snap->bgm->gain : 1000;
-        const int64_t pan = snap->bgm ? snap->bgm->pan : 0;
-        variables_.set(name + ".playing", Value::make_int(playing));
-        variables_.set(name + ".gain", Value::make_int(gain));
-        variables_.set(name + ".pan", Value::make_int(pan));
-        size_t index = 0;
-        for (const auto& ch : snap->se) {
-            variables_.set(name + "." + std::to_string(index) + ".id",
-                           Value::make_string(ch.id));
-            variables_.set(name + "." + std::to_string(index) + ".playing",
-                           Value::make_int(ch.playing ? 1 : 0));
-            variables_.set(name + "." + std::to_string(index) + ".gain",
-                           Value::make_int(ch.gain));
-            variables_.set(name + "." + std::to_string(index) + ".pan",
-                           Value::make_int(ch.pan));
-            ++index;
-        }
-        variables_.set(name + ".size", Value::make_int(int64_t(snap->se.size())));
-        return true;
-    }
     if (system == "screen_width" || system == "screen_height") {
         variables_.set(name, Value::make_int(system == "screen_width" ? config_.stage_width
                                                                        : config_.stage_height));
         return true;
     }
-    if (system == "get_layer_info") {
-        // Slider readback (slider_dragX/xslider_pin …): dump every layer
-        flush_pending_text_tags();
-        const std::string id = eval.resolve_param_str(get("id"));
-        if (hooks_.layer_info && !id.empty()) {
-            const auto props = hooks_.layer_info(id);
-            for (const auto& [k, v] : props) variables_.set(name + "." + k, Value::make_string(v));
-        }
-        return true;
-    }
     // misc-A: backlog 查询桥（ HostQueryHooks，）。参
     // 参数语义：name/page/id/allfont 均按原文取值（不解析表达式——
     // apply_var_tag 的表达式参数表不含 id/page/name）；allfont 为 tag_bool 开。
-    if (system == "get_backlog_size") {
-        // name = 总历史页数；无钩子 → 保守回退 0。
-        const size_t size = hooks_.backlog_size ? hooks_.backlog_size() : 0;
-        variables_.set(name, Value::make_int((long long)size));
-        return true;
-    }
-    if (system == "get_backlog_tags") {
-        long long page = 0;
-        try {
-            page = std::stoll(get("page"));
-        } catch (...) {
-            page = 0;
-        }
-        if (page < 0) page = 0;
-        const bool allfont = tag_bool(get("allfont"), false);
-        std::optional<std::vector<std::string>> tags =
-            hooks_.backlog_tags ? hooks_.backlog_tags((size_t)page, allfont) : std::nullopt;
-        // 伪数组 name.0..N-1 + name.size；未命中/越界 → 只落 size=0。
-        if (tags) {
-            for (size_t i = 0; i < tags->size(); ++i) {
-                variables_.set(name + "." + std::to_string(i),
-                               Value::make_string((*tags)[i]));
-            }
-            variables_.set(name + ".size", Value::make_int((long long)tags->size()));
-        } else {
-            variables_.set(name + ".size", Value::make_int(0));
-        }
-        return true;
-    }
-    if (system == "get_message_tags") {
-        const std::string id = get("id");
-        const bool allfont = tag_bool(get("allfont"), false);
-        std::optional<std::vector<std::string>> tags =
-            hooks_.message_tags ? hooks_.message_tags(id, allfont) : std::nullopt;
-        if (tags) {
-            for (size_t i = 0; i < tags->size(); ++i) {
-                variables_.set(name + "." + std::to_string(i),
-                               Value::make_string((*tags)[i]));
-            }
-            variables_.set(name + ".size", Value::make_int((long long)tags->size()));
-        } else {
-            variables_.set(name + ".size", Value::make_int(0));
-        }
-        return true;
-    }
-    // 当前消息层文本度量（ message_layer_metrics）。
-    // Lua get_fontsize 创建临时消息层、排入测量文本后通过这组 key 读取排版尺寸，
-    // 用于字体替换时的等比缩放。无钩子 → 0（Lua 侧 math.ceil(35*0/0) = nan →
-    // 字体参数不生效；因此必须接入宿主度量）。
-    if (system == "get_message_layer_width" ||
-        system == "get_message_layer_height" ||
-        system == "get_message_layer_line_width") {
-        flush_pending_text_tags();
-        double width = 0, height = 0, line_width = 0;
-        if (hooks_.message_layer_metrics) {
-            const auto [w, h, lw] = hooks_.message_layer_metrics();
-            width = w; height = h; line_width = lw;
-        }
-        const double value = (system == "get_message_layer_width") ? width
-                           : (system == "get_message_layer_height") ? height
-                           : line_width;
-        variables_.set(name, Value::make_string(std::to_string(value)));
-        return true;
-    }
     // Remaining var system= keys (substr/explode/find/...) are added as their
     // host services land; silently ignored for now.
     return true;
@@ -3419,16 +3382,13 @@ std::optional<ExecutionResult> Interpreter::flush_tag_queue() {
     // A queued [call] suspended the drain: the callee must run (and return)
     // before the caller's remaining queued tags may execute — those tags were
     // enqueued in the caller's context and their labels resolve there.
-    if (queue_hold_depth_ != 0) {
-        // The hold protects a queued [call]: the tags behind it belong to the
-        if (parked_ || call_stack_.size() < queue_hold_depth_) {
-            queue_hold_depth_ = 0;
-        } else {
-            return std::nullopt;
-        }
-    }
-    parked_ = false;
     while (!tag_queue_.empty()) {
+        // 一条排队 tag（常见是 [calllua] 里 e:tag 了全屏影片）要停驻：
+        // 后面的队列属于下一步，不能抢在停驻前面跑。
+        if (auto parked = take_immediate_park()) return parked;
+        if (std::getenv("OA_LOADDBG"))
+            std::fprintf(stderr, "[ld] drain %s (left=%zu)\n", tag_queue_.front().tag.c_str(),
+                         tag_queue_.size());
         Instruction ins = std::move(tag_queue_.front());
         tag_queue_.erase(tag_queue_.begin());
         if (on_step) on_step(*current_script_name_, current_line_, ins);
@@ -3450,26 +3410,24 @@ std::optional<ExecutionResult> Interpreter::flush_tag_queue() {
             case TagOutcomeKind::Continue:
                 continue;
             case TagOutcomeKind::Jump:
-                queued_saw_jump_ = true;
-                arrived_by_jump_ = true;
-                current_line_ = outcome.line;
-                continue;
             case TagOutcomeKind::JumpExternal: {
+                const bool external = outcome.kind == TagOutcomeKind::JumpExternal;
                 queued_saw_jump_ = true;
-                if (hooks_.exskip_jump_target) hooks_.exskip_jump_target(outcome.file);
-                // A handler-issued jump that LEAVES the script a page park
-                // belongs to is an escape: the flow it enters ends with its own
-                // [return], and that return must land back on the parked page
-                // instead of unwinding the caller chain (test13 quick save:
-                // the closing [return] popped the story frame and turned a
-                // page). Same-script jumps (local gotos) keep the old shape:
-                // their [return] belongs to the [call] that encloses them.
-                const bool leaves_script =
-                    current_script_name_ && outcome.file != *current_script_name_;
-                // ...and only from the base context: once a [call] is in
-                // flight, that frame owns the way back (UI screens close
-                // through ReturnStack()/[return], and an extra frame here
-                // would swallow exactly that return).
+                if (external && hooks_.exskip_jump_target)
+                    hooks_.exskip_jump_target(outcome.file);
+                // 一条**从 Lua 排下的** [jump] 是框架的"流程入口"：它进入的
+                // 那段脚本以自己的 [return] 结束，那个 return 必须落回被跳走
+                // 的那一页，而不是把调用链弹穿。
+                //
+                // 判据不是"换了文件"：原始 Artemis 的 `fn.push()` 就是在
+                // system/script.asb **内部**跳到 popfuncNN（同一个文件），它
+                // 的 [return] 同样要回到剧情页（NekoMiko：进 config 再回来
+                // 剧情卡死，就是这一跳没拿到回程帧，popfuncNN 末尾的
+                // [return] 在空栈上把脚本结束了）。
+                //
+                // 真正的判据：这一跳打断了一个**活着的页面停驻**，且当前不在
+                // 任何 [call] 里——在 [call] 里时那一帧自己负责回程（UI 界面
+                // 靠 ReturnStack()/[return] 关闭，多一层会吞掉那个 return）。
                 bool inside_call = false;
                 for (const auto& f : call_stack_) {
                     if (f.id != 0) {
@@ -3477,17 +3435,24 @@ std::optional<ExecutionResult> Interpreter::flush_tag_queue() {
                         break;
                     }
                 }
-                if (leaves_script && !inside_call) {
-                    const uint64_t frame_id = next_frame_id_++;
-                    // The runtime only accepts this while a page click wait is
-                    // live; it then holds that park for the return.
-                    if (hooks_.queued_jump_frame && hooks_.queued_jump_frame(frame_id)) {
-                        if (call_stack_.size() >= 512) {
-                            throw ScriptError("jump", "jump: stack too deep (512)", 0);
-                        }
-                        call_stack_.push_back(
-                            CallFrame{*current_script_name_, current_line_, frame_id});
+                if (!inside_call && hooks_.jump_needs_return_frame &&
+                    hooks_.jump_needs_return_frame()) {
+                    if (call_stack_.size() >= 512) {
+                        throw ScriptError("jump", "jump: stack too deep (512)", 0);
                     }
+                    save_frame_queue();
+                    CallFrame ret;
+                    ret.script = *current_script_name_;
+                    ret.return_line = current_line_;
+                    ret.id = next_frame_id_++;
+                    ret.anon = true; // 对外报空文件名（ReturnStack 的把手）
+                    call_stack_.push_back(std::move(ret));
+                    if (hooks_.frame_pushed) hooks_.frame_pushed();
+                }
+                if (!external) {
+                    arrived_by_jump_ = true;
+                    current_line_ = outcome.line;
+                    continue;
                 }
                 load_external_script(outcome.file);
                 const Script* t = get_script(outcome.file);
@@ -3511,12 +3476,15 @@ std::optional<ExecutionResult> Interpreter::flush_tag_queue() {
                 // queued call: return_line = current_line (do NOT add 1)
                 const size_t pinned = call_stack_.size();
                 const uint64_t frame_id = next_frame_id_++;
+                // 队列归帧：排在 [call] 后面的 tag 属于调用者，存进它的那一层；
+                // 被调方从空队列开始（除非这个框架方言把队列交给被调方）。
+                if (outcome.label.empty()) save_frame_queue();
                 call_stack_.push_back(CallFrame{*current_script_name_, current_line_, frame_id});
                 (void)pinned;
-                // A handler-issued call takes the current execution over: let
-                // the runtime park the live wait/queued tail on this frame so
-                // the caller resumes exactly where it was on [return].
-                if (hooks_.queued_call_frame) hooks_.queued_call_frame(frame_id);
+                // A handler-issued call takes the current execution over: the
+                // frame push moves the live park into the context stack, so the
+                // caller resumes exactly where it was on [return].
+                if (hooks_.frame_pushed) hooks_.frame_pushed();
                 const std::string target = outcome.file.empty() ? *current_script_name_
                                                                 : outcome.file;
                 if (!outcome.file.empty()) load_external_script(target);
@@ -3528,24 +3496,17 @@ std::optional<ExecutionResult> Interpreter::flush_tag_queue() {
                 current_script_name_ = target;
                 current_line_ = *line;
                 arrived_by_jump_ = true;
-                // Hold the rest of the queue until this callee returns (see
-                // queue_hold_depth_): queued tags behind a queued [call] were
-                // enqueued by the caller and must resolve in the caller's
-                // script, not in the callee we just entered.
-                // 空标签的 [call] = "从文件头开始跑"：框架用它执行脚本的初始化
-                // 段（system/msg.iet 的头里就是 ADV/backlog 字体）。这种 call
-                // 必须让被调方跑完，否则后面的队列标签会把位置挪走、初始化一句
-                // 都执行不到（test13 backlog 字体缺失就是这么来的）。
-                if (hooks_.queue_call_hold || outcome.label.empty()) {
-                    queue_hold_depth_ = call_stack_.size();
-                    return std::nullopt;
-                }
+                // FPM 方言不带 hold：带标签的队列 [call] 把调用者的剩余 tag
+                // 一起接管（estag 的整段 UI 入口是一个突发）。其它方言的
+                // tag 留在调用者那一层，被调方从空队列开始。
                 continue;
             }
             case TagOutcomeKind::Return: {
-                if (return_floor_ != 0 && call_stack_.size() <= return_floor_) {
-                    // A macro's return burst must not unwind the real caller
-                    // chain (see set_return_floor): drop the extra [return]s.
+                // 一条排队的 [return] 只能弹到"排下它的那一层"：事件处理会话
+                // 排的 tag 带地板，宏的 return 突发不许弹穿玩家正在读的那一页。
+                // 地板挂在指令自己身上（谁排的谁负责），不再需要全局 floor 状态。
+                if (ins.floor_depth != Instruction::kNoFloor &&
+                    call_stack_.size() <= ins.floor_depth) {
                     continue;
                 }
                 if (!call_stack_.empty()) {
@@ -3553,6 +3514,7 @@ std::optional<ExecutionResult> Interpreter::flush_tag_queue() {
                         current_script_name_ ? *current_script_name_ : "";
                     const CallFrame frame = call_stack_.back();
                     call_stack_.pop_back();
+                    restore_frame_queue(); // 这一帧剩下的 tag 随帧作废
                     restore_macro_params(call_stack_.size() + 1);
                     current_script_name_ = frame.script;
                     current_line_ = frame.return_line;
@@ -3560,7 +3522,7 @@ std::optional<ExecutionResult> Interpreter::flush_tag_queue() {
                     // A frame that carried a suspended park resumes the caller
                     // context right here: stop the drain (the restored wait
                     // owns the next input).
-                    if (frame.id && hooks_.frame_popped && hooks_.frame_popped(frame.id))
+                    if (hooks_.frame_popped && hooks_.frame_popped())
                         return ExecutionResult::ParkRestored;
                     continue;
                 }
@@ -3575,16 +3537,13 @@ std::optional<ExecutionResult> Interpreter::flush_tag_queue() {
                     last_wait_from_queue_ = true;
                     note_wait_reason(outcome.event);
                     last_wait_event_ = outcome.event;
-                    parked_ = true;
+                    note_stable_park();
                     return ExecutionResult::Wait;
                 }
                 throw ScriptError("aborted", "callback aborted", 0);
             }
         }
     }
-    // The click's queued tags (handler nav + the macro's return burst) are
-    // fully drained: release the caller-chain guard.
-    return_floor_ = 0;
     return std::nullopt;
 }
 

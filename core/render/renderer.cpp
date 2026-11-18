@@ -52,6 +52,9 @@ void RenderEngine::configure(const oa::fs::IFileSystem* fs, oa::render::RenderHo
     text_ptr_ = text;
     scene_ptr_ = scene;
     fontSystem = std::make_unique<oa::render::FontSystem>(fs, host, text_ptr_);
+    // 文本内容存在节点上：TextEngine 直接读写场景里的 Layer::text。
+    // 节点删 = 文本没了，不需要任何跨子系统通知。
+    if (text_ptr_ && scene_ptr_) text_ptr_->attach(scene_ptr_);
     if (bind_hooks) bind_runtime_hooks();
 }
 
@@ -281,6 +284,7 @@ bool RenderEngine::stage_to_window_coordinates(float sx, float sy, float* wx, fl
 bool RenderEngine::warp_mouse_to_stage(float sx, float sy)
 {
     if (!window_) return false;
+    if (SDL_GetWindowFlags(window_) & SDL_WINDOW_HIDDEN) return true;
     float wx = 0.0f, wy = 0.0f;
     if (!stage_to_window_coordinates(sx, sy, &wx, &wy)) return false;
     SDL_WarpMouseInWindow(window_, wx, wy);
@@ -1024,6 +1028,25 @@ TextureRef RenderEngine::texture_for_asset(const std::string& name)
     return texture_for_key(oa::render::asset_key(name));
 }
 
+void RenderEngine::forget_asset(const std::string& name)
+{
+    if (name.empty()) return;
+    // 解码像素和贴图都按层 content key（path + file，不带扩展名）缓存：
+    // 丢掉这一份，按新文件重新解码/上传，再把画面标脏 —— 下一帧就是新图。
+    if (const auto it = decoded.find(name); it != decoded.end()) {
+        decoded_bytes_ -= std::min(decoded_bytes_, it->second.rgba.size());
+        decoded.erase(it);
+        decoded_use_.erase(name);
+    }
+    const oa::render::TextureKey key = oa::render::asset_key(name);
+    if (const auto it = textures.find(key); it != textures.end()) {
+        if (it->second) backend_->destroy_texture(it->second);
+        textures.erase(it);
+    }
+    if (backend_) (void)texture_for_asset(name);
+    request_repaint();
+}
+
 TextureRef RenderEngine::texture_for_key(const oa::render::TextureKey& key)
 {
     if (key.empty()) return nullptr;
@@ -1377,6 +1400,13 @@ void RenderEngine::stop_all_delete()
 
 void RenderEngine::note(Note what)
 {
+    // 统计 + **强制重绘**。
+    //
+    // 曾经想只留 revision 一个失效信号（把这里降级成纯统计），但那要求
+    // "所有写路径都 touch()"。实际并不是：恢复事件行、宿主纹理刷新、
+    // 读档后的部分簿记都不经过 touch —— 少一次重绘，屏幕上就留着上一帧的
+    // 字（"读档后文字残留"正是这个形状）。两个信号宁可多画一帧。
+    dirty_ = true;
     switch (what) {
         case Note::Layer: ++stats_.layers; break;
         case Note::Tween: ++stats_.tweens; break;
@@ -1384,7 +1414,6 @@ void RenderEngine::note(Note what)
         case Note::Text: ++stats_.text; break;
         case Note::MessageSwitch: ++stats_.message_switch; break;
     }
-    dirty_ = true;
 }
 
 bool RenderEngine::render_frame(uint64_t now_ms, double global_fade)
@@ -1413,7 +1442,6 @@ bool RenderEngine::render_frame(uint64_t now_ms, double global_fade)
     render_begin();
     draw_scene(scene(), global_fade);
     progress_transition();
-    if (host_) host_->post_frame_capture();
     render_end();
 
     if (vsync_active_) {
@@ -1569,8 +1597,6 @@ namespace {
 struct Builder {
     const PlanInput& in;
     RenderPlan* out;
-    /// 槽位 → 绑定到它的消息层 id（每帧快照，纯读）。
-    std::map<std::string, std::vector<std::string>> messages;
     /// 组背板锚框缓存（与旧 anchor_frame_cache_ 同语义，仅本次构建有效）。
     std::map<std::string, std::optional<IRect>> anchor_cache;
 
@@ -1784,12 +1810,15 @@ struct Builder {
         }
     }
 
-    /// 该槽位绑定的字形（消息层）。
+    /// 该节点的字形（文本就是这个节点的内容）。
+    ///
+    /// 不再有"槽位 → 消息层"的映射表：`[chgmsg]` 选中的 id 就是节点 id，
+    /// 文本存在 `Layer::text` 上。走到哪个节点就画它自己的字。
     void emit_glyphs(const Layer& l, const Affine2& world, double op) {
-        const auto it = messages.find(l.id);
-        if (it == messages.end() || it->second.empty()) return;
+        if (!l.text || l.text->char_count == 0 || l.text->text_hidden) return;
+        if (!in.scene->is_message_layer_drawable(l.id, l.text->positioned)) return;
         PlanItem& g = out->push(PlanOp::Glyphs, l.id);
-        g.messages = it->second;
+        g.messages = {l.id};
         g.world = world;
         g.opacity = op;
     }
@@ -1867,22 +1896,11 @@ void build_render_plan(const PlanInput& in, RenderPlan* out) {
     if (!in.scene) return;
 
     Builder b{in, out};
-    // 槽位 → 消息层 id（纯快照；绘制=可见 + 有绘制盒/显式节点）。
-    if (in.text) {
-        for (const std::string& mid : in.text->visible_content_layers()) {
-            const MessageLayer* ml = in.text->layer(mid);
-            if (!in.scene->is_message_layer_drawable(mid, ml && ml->positioned))
-                continue;
-            b.messages[in.scene->bound_scene_id(mid)].push_back(mid);
-        }
-    }
+    // 文本不再是独立的"槽位映射"：它是节点的内容，walk 到节点自己画。
     const Affine2 root_w = in.scene->root_props().local_transform();
     const double root_op = in.scene->root_props().alpha * in.global_fade;
     for (const SceneNode* r : in.scene->roots())
         b.walk(*r, root_w, root_op, std::nullopt);
-    // Message slots draw after the scene region.
-    for (const SceneNode* s : in.scene->message_slots())
-        b.walk(*s, root_w, root_op, std::nullopt);
     // Overlay-video slot: structurally topmost; stage space (root props ignored).
     if (const SceneNode* ov = in.scene->overlay_node())
         b.walk(*ov, Affine2{}, 1.0, std::nullopt);

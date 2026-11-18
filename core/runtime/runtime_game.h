@@ -1,4 +1,6 @@
 #pragma once
+
+namespace oa::render { class RenderPlan; }
 // Engine surface: GameRuntime = project + interpreter + Artemis waits + render
 // host. Host apps / the SDL layer include runtime.h (App) instead of this.
 #include <cstdint>
@@ -95,7 +97,8 @@ public:
     const oa::runtime::Interpreter& interpreter() const;
     const std::shared_ptr<const oa::fs::IFileSystem>& fs() const;
     /// Create the backend on the host window and start media players.
-    bool attach_window(void* native_window, const std::string& renderer_kind);
+    bool attach_window(void* native_window, const std::string& renderer_kind,
+                       bool with_audio = true);
     int stage_width() const override;
     int stage_height() const override;
     bool vsync_active() const;
@@ -113,11 +116,12 @@ public:
         const std::string& rel_path) const override;
     void bind_text_metrics(
         std::function<std::tuple<double, double, double>()> fn) override;
+    /// 文本度量是否已由宿主接入（[reset] 只重置脚本域，不动它）。
+    bool has_text_metrics() const;
     /// Apply [trans]: type 0 clears, otherwise starts a capture transition.
     void transition_begin(const std::map<std::string, std::string>& params) override;
     oa::render::Transition& transition_state();
     /// [takess] capture runs after presenting the current frame.
-    void post_frame_capture() override;
     using EmoteLayerState = oa::emote::LayerState;
     const std::map<std::string, EmoteLayerState>& emote_layers() const;
     oa::media::VideoEngine& video();
@@ -218,6 +222,9 @@ public:
     /// Host frame capture for [takess]/[savess] (RGBA). Absent => savess
     /// writes a deterministic placeholder thumbnail.
     using CaptureFn = std::function<std::optional<std::vector<uint8_t>>(uint32_t*, uint32_t*)>;
+    void capture_screenshot();
+    /// 当前渲染队列（上一帧求值的结果）。测试靠它看"谁会画、画在哪"。
+    const oa::render::RenderPlan* current_plan() const;
     void set_frame_capture(CaptureFn fn);
     /// syssave: persist g./s. domains into saveg.dat/system.dat.
     bool syssave();

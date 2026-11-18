@@ -164,6 +164,12 @@ struct Instruction {
     size_t line = 0;
     /// Script that was executing when this row was ENQUEUED from Lua
     std::string origin_script;
+    /// 一条排队 [return] 的"地板"：它最多只能弹到排下它的那一层。
+    /// 只有**事件处理会话**排的 tag 才有地板（玩家点一下按钮、宏随即发一串
+    /// [return]，那一串不许把玩家正在读的剧情帧弹掉）；脚本自己 e:tag{"return"}
+    /// 关 UI 时没有地板，该弹就弹。`kNoFloor` = 不设限。
+    static constexpr size_t kNoFloor = static_cast<size_t>(-1);
+    size_t floor_depth = kNoFloor;
 
     const std::string* get(std::string_view key) const {
         const auto it = params.find(std::string(key));
@@ -407,14 +413,25 @@ struct CallFrame {
     /// Frame identity for the host's suspended-park bookkeeping. 0 = synthetic
     /// marker (inline-event anchor, no continuation attached).
     uint64_t id = 0;
+    /// 事件处理帧（原版 Artemis 里 file=="" 的那一层）。
+    ///
+    /// 框架的 ReturnStack()/ReturnStackAll() 通过 e:getScriptStack() 找"最顶层
+    /// 的 file==\"\" 帧"来决定发不发 [return]：处理帧就是它关闭 UI 会话的把手。
+    /// 这里保存的是**宿主脚本位置**（用于 [return] 弹栈后回到原行），但对外
+    /// （getScriptStack）报成空文件名。
+    bool synthetic = false;
+    /// 由**排队 [jump]** 压出来的回程帧（框架的 `fn.push()`/UI 入口）。
+    ///
+    /// 原版里这类帧在 `e:getScriptStack()` 上的文件名是空的——框架的
+    /// `ReturnStack()` 正是靠 `ss[#ss].file == ""` 判断"现在在 UI 流程里、
+    /// 该发 [return] 把它收掉"。我们压帧时知道返回地址，但对外必须同样报空，
+    /// 否则 `ReturnStack()` 什么都不做，UI 永远停在 `[stop]`（test13 存档后
+    /// 回不到正文就是这个）。
+    bool anon = false;
 };
 
 // Host-side capability hooks (filled by the engine runtime and its Lua layer).
 struct InterpreterHooks {
-    /// Framework flavour switch for e:tag ordering: when true (default) the
-    bool immediate_tags = true;
-    /// Queued-[call] hold (see Interpreter::queue_hold_depth_). When true, a
-    bool queue_call_hold = true;
     /// Execute a [lua] block (called at script load; fallback when stepped over).
     std::function<void(const std::string& code, const std::string& script_name, size_t line)>
         run_lua_block;
@@ -426,69 +443,37 @@ struct InterpreterHooks {
         call_lua_function;
     /// File loader used by load_external_script / [macroadd] / Lua file reads.
     std::function<std::optional<std::vector<uint8_t>>(const std::string&)> file_loader;
-    /// Read the effective props of one scene layer by id (e:var system=
-    /// "get_layer_info"; slider readback). Empty map when absent.
-    std::function<std::map<std::string, std::string>(const std::string&)> layer_info;
-    /// e:var system=get_backlog_size: stored backlog page count (misc-A).
-    /// Absent hook
-    /// behaves as 0 ( conservative fallback).
-    std::function<size_t()> backlog_size;
-    /// e:var system=get_backlog_tags: reproduction tag sequence of backlog
-    /// page `page` (0-based, allfont prefix rule); nullopt when out of range
-    /// or hook absent → caller falls back to size=0 only.
-    std::function<std::optional<std::vector<std::string>>(size_t page, bool allfont)>
-        backlog_tags;
-    /// e:var system=get_message_tags: executed text tags of the current page
-    /// on message layer `id`; nullopt when the layer does not exist / hook
-    /// absent → caller falls back to size=0 only.
-    std::function<std::optional<std::vector<std::string>>(const std::string& id,
-                                                          bool allfont)>
-        message_tags;
+    /// `e:var(system=...)` 的**宿主数据面**。
+    ///
+    /// 解释器只管协议：解析 `e:var`、把结果写进变量域（`name`、`name.size`、
+    /// `name.N` 这些形状由返回的写列表原样表达）。数据本身归宿主——层属性、
+    /// 回放记录、消息层标签都在 runtime 里，不该在脚本 VM 的头文件上各开一个洞。
+    /// 返回 nullopt = 这个名字宿主不管，解释器继续走自己的通用分支。
+    using VarWrites = std::vector<std::pair<std::string, oa::runtime::Value>>;
+    std::function<std::optional<VarWrites>(const std::string& system,
+                                          const std::string& name,
+                                          const std::map<std::string, std::string>& params)>
+        system_var;
     /// Sound playback snapshot for e:var system=get_sound_info (misc-B):
     /// BGM
     /// slot + SE list sorted by id; voices riding the SE bus appear there).
-    struct SoundChannelSnap {
-        std::string id;
-        bool playing = false;
-        int64_t gain = 1000; // raw Artemis scale
-        int64_t pan = 0;
-    };
-    struct SoundInfoSnap {
-        std::optional<SoundChannelSnap> bgm;
-        std::vector<SoundChannelSnap> se;
-    };
-    std::function<std::optional<SoundInfoSnap>()> sound_info;
     /// Resource (asset) existence/read after magic-path resolution. The
     /// runtime wires these save-area aware (names under the savepath resolve
     /// through the save store first). Absent => file_loader fallback.
     std::function<bool(const std::string& resolved)> resource_exists;
     std::function<std::optional<std::vector<uint8_t>>(const std::string& resolved)>
         resource_read;
-    /// Save-area existence (e:var file_exists save=1). Absent => false.
-    std::function<bool(const std::string& file)> save_file_exists;
-    /// Absolute save-area root. Backs the Lua `io.open` redirect: the iMel
-    std::function<std::string()> save_root;
-    /// Save-area modification time (e:var file_update_time).
-    /// Absent => noexist default.
-    std::function<std::optional<std::array<int64_t, 6>>(const std::string& file)>
-        file_mtime;
-    /// Monotonic per-tick frame number (e:getFrameNumber). Absent => the
-    /// lua host falls back to an fps projection of the interpreter clock.
-    std::function<uint64_t()> frame_number;
     /// 当前消息层文本度量 (整体宽度, 总高度, 最后一行宽度)。
     /// 供 var system=get_message_layer_width/height/line_width（Lua get_fontsize
     /// 字体测量流程）。
     /// 无钩子时查询落 0。
-    std::function<std::tuple<double, double, double>()> message_layer_metrics;
-    /// A queued (handler-issued) [call] pushed `frame_id`. The runtime suspends
-    /// the live park (wait + pending parks + queued tail) on this frame so the
-    /// story can resume exactly where it was when the callee returns.
-    std::function<void(uint64_t frame_id)> queued_call_frame;
-    /// A queued (handler-issued) [jump] that leaves the parked script: the
-    /// runtime suspends the page park on a return frame when it returns true
-    /// (the interpreter then pushes that frame, so the flow's own [return]
-    /// lands back on the page). False = no page park; the jump owns the flow.
-    std::function<bool(uint64_t frame_id)> queued_jump_frame;
+    /// 每压一层**执行上下文**帧就通知一次（脚本 [call]、队列 [call]、可回程的
+    /// [jump]）。处理会话帧不通知：它是 ReturnStack 的把手，与所在层共享上下文。
+    /// 宿主把外层停驻移进上下文栈，当前层从空白开始——帧即执行上下文。
+    std::function<void()> frame_pushed;
+    /// 处理函数把执行跳到别的脚本时问一次：这一层有值得回程的页面停驻吗？
+    /// true → 解释器压一层返回帧，让流程自己的 [return] 落回那一页。
+    std::function<bool()> jump_needs_return_frame;
     /// A queued [jump file=X] executed. The framework's backlog replay jumps
     /// to the recorded script right after e:debugSkip{index=N}; the runtime
     /// notes X so the recorded instruction index is only compared inside the
@@ -500,10 +485,9 @@ struct InterpreterHooks {
     /// end-of-replay flow queued (exskip_end) before executing the line, so
     /// the page is redrawn inside the same run instead of waiting for input.
     std::function<bool(const std::string& script, size_t line)> exskip_boundary;
-    /// A [return] popped `frame_id`. Returns true when the runtime restored a
-    /// suspended park: stepping must stop immediately (ExecutionResult::
-    /// ParkRestored) instead of running on past the restored wait.
-    std::function<bool(uint64_t frame_id)> frame_popped;
+    /// 每弹一层调用帧就通知一次。返回 true = 交还了一个活着的停驻，步进必须
+    /// 立刻停（ExecutionResult::ParkRestored），不能再跑过这个停驻。
+    std::function<bool()> frame_popped;
 };
 
 class Interpreter {
@@ -525,6 +509,18 @@ public:
     const Script* get_script(const std::string& name) const;
 
     // -- execution -----------------------------------------------------------
+    /// 事件处理会话：压一层合成帧（对外 file==""）。处理函数运行期间它就在
+    /// 栈顶，框架的 ReturnStack() 因此看得到"处理帧"并发 [return]。
+    bool begin_handler_frame();
+    /// 结束会话：把合成帧以及它上面的一切弹掉，光标回到会话入口。
+    /// frame_popped 沿途交还处理函数 [call] 寄存的页面停驻。
+    bool handler_return_now();
+    bool in_handler_frame() const {
+        return !call_stack_.empty() && call_stack_.back().synthetic;
+    }
+    /// 处理函数没触发 ReturnStack：会话帧还在栈顶时把它收掉。
+    void end_handler_frame();
+
     void start(const std::string& script, std::string_view label);
     /// Boot: *main -> *start -> *_start -> file head; tries macro.iet silently.
     void boot(const std::string& script);
@@ -550,17 +546,38 @@ public:
     /// the project's tag.ini). Empty when the file or the section is absent,
     /// in which case the row's columns stay positional ("1", "2", ...).
     const std::vector<std::string>& line_tag_params(const std::string& tag);
-    /// Rewrite ONLY the call stack, leaving the current position and the
-    /// queue-wait/arrival flags untouched (inline-event settle uses this
-    /// to drop the synthetic marker frame — restore_position would clear
-    /// last_wait_from_queue_, making a later next_line skip the parked
-    /// wait's [return] row).
-    void set_call_stack(std::vector<CallFrame> stack) {
-        if (queue_hold_depth_ != 0 && stack.size() < queue_hold_depth_) {
-            queue_hold_depth_ = 0; // held callee frame removed outside the run loop
+    /// 逻辑调用深度：**处理会话帧不算一层**（它是 ReturnStack 的把手，与它
+    /// 所在的那层共享执行上下文）。排队 tag 的归属按这个深度算。
+    size_t logical_depth() const {
+        size_t d = call_stack_.size();
+        for (const auto& f : call_stack_) {
+            if (f.synthetic) --d;
         }
-        call_stack_ = std::move(stack);
+        return d;
     }
+    /// 压帧：当前层的剩余 tag 存进这一帧，被调方从空队列开始。
+    void save_frame_queue() {
+        queue_stack_.push_back(std::move(tag_queue_));
+        tag_queue_.clear();
+    }
+    /// 弹帧：恢复调用者的队列，并把这一帧排下的 tag 接在后面。
+    ///
+    /// **不能丢**：框架的宏经常"先排一整段 UI 初始化再 [return]"，那些 tag
+    /// 属于机器而不是那一帧（iMel 的启动就是一次排下 600+ 条）。丢弃它们
+    /// 会让 UI 再也不出现。顺序保持 FIFO：调用者的 tag 排在前面（它们本来
+    /// 就先入队）。
+    void restore_frame_queue() {
+        std::vector<Instruction> mine;
+        mine.swap(tag_queue_);
+        tag_queue_ = queue_stack_.empty() ? std::vector<Instruction>{}
+                                          : std::move(queue_stack_.back());
+        if (!queue_stack_.empty()) queue_stack_.pop_back();
+        tag_queue_.insert(tag_queue_.end(), std::make_move_iterator(mine.begin()),
+                          std::make_move_iterator(mine.end()));
+    }
+    /// Rewrite ONLY the call stack, leaving the current position and the
+    /// queue-wait/arrival flags untouched.
+    void set_call_stack(std::vector<CallFrame> stack) { call_stack_ = std::move(stack); }
     /// Put the cursor on a script row without touching the call stack or the
     /// queue-wait flags. Used when a suspended park is handed back: the park
     /// belongs to the page it was armed on, and closing the UI that took it
@@ -659,16 +676,37 @@ public:
     /// that kind; consumed by the runtime's inline-event-frame settle after
     /// each drain round.
     bool queued_saw_call() const { return queued_saw_call_; }
-    /// Click-handler return floor: while the queued tags of one pointer click
-    void set_return_floor(size_t depth) { return_floor_ = depth; }
-    size_t return_floor() const { return return_floor_; }
-    void clear_return_floor() { return_floor_ = 0; }
     bool queued_saw_jump() const { return queued_saw_jump_; }
 
     // -- state ---------------------------------------------------------------
     const std::string* current_script() const;
     size_t current_line() const { return current_line_; }
     const std::vector<CallFrame>& call_stack() const { return call_stack_; }
+    /// 玩家当前看到的那一页的位置（存档恢复点）。
+    const std::string& stable_script() const { return stable_script_; }
+    size_t stable_line() const { return stable_line_; }
+    /// Lua `tags.<tag>` 处理器作用域：这期间 `e:tag{"return"}` 立即弹帧。
+    void enter_lua_tag_handler() { in_lua_tag_handler_ = true; }
+    void leave_lua_tag_handler() { in_lua_tag_handler_ = false; }
+
+    /// 有文字页被画出来：记这一行（深 0 才记，宏里的 print 不算剧情位置）。
+    /// 读档从这一行恢复 = 把玩家看到的那一页重新画一遍。
+    void note_page_printed() {
+        if (!call_stack_.empty() || !current_script_name_) return;
+        stable_script_ = *current_script_name_;
+        stable_line_ = current_line_;
+        page_printed_since_park_ = true;
+    }
+    /// 停驻这一刻记位置。文字页已经记过就不覆盖：`[print]` 之后紧跟的
+    /// `[click]` 只是等输入，从 print 行恢复才能重现同一页。
+    void note_stable_park() {
+        if (!call_stack_.empty() || !current_script_name_) return;
+        if (!page_printed_since_park_) {
+            stable_script_ = *current_script_name_;
+            stable_line_ = current_line_;
+        }
+        page_printed_since_park_ = false;
+    }
     VariableStore& variables() { return variables_; }
     const VariableStore& variables() const { return variables_; }
     void set_variable(const std::string& name, Value v) { variables_.set(name, std::move(v)); }
@@ -710,6 +748,19 @@ public:
     void set_callback(std::function<CallbackResult(const Event&)> cb) {
         callback_ = std::move(cb);
     }
+    /// 立即执行的 tag（`e:tag`）里宿主要求停驻的事件。
+    ///
+    /// 我们的立即执行路径（run_tag_now）只把事件派发给宿主，**丢掉了 Pause
+    /// 返回值** —— 影片于是脱离脚本：没有视频停驻，后面的 `[wt]` 又只是普通
+    /// 点击等待，点击放开 `[wt]` 后影片继续盖在画面上（"跳过依旧占据屏幕"）。
+    /// 这里把宿主的裁决留下来，由 run()/队列排空在下一个边界转成 Wait。
+    std::optional<Event> pending_immediate_park_;
+    /// run() 的嵌套深度：只有在脚本流里才接住 Pause（UI 回调里的事件由
+    /// 派发方自己处理停驻，不能在这里重复建）。
+    int run_depth_ = 0;
+    /// 有挂起的立即停驻就转成一次 Wait（并记账 last_wait_event_）。
+    std::optional<ExecutionResult> take_immediate_park();
+
     /// The Wait event that made run return Wait (cleared on next_line).
     const Event* last_wait_event() const { return last_wait_event_.has_value() ? &*last_wait_event_ : nullptr; }
     /// Whether the current wait came from the tag queue (next_line no-op).
@@ -734,18 +785,34 @@ private:
     bool line_tags_loaded_ = false;
     std::optional<std::string> current_script_name_;
     size_t current_line_ = 0;
+    /// 最近一次**最外层停驻**的位置（调用栈为空时的 `[stop]`/`[@]` 所在行）。
+    ///
+    /// 存档用它当恢复点。存档动作几乎总发生在宏/UI 调用里
+    /// （`adv_save` → `save_write` → `[save]`，中间还夹着 `attack_check`），
+    /// 这时 `current_script_name_` 是 system.iet 的宏体；照它存档，读档后会在
+    /// 宏中间接着跑，剧情再也接不上（test13：读档后卡在 ui.asb 的 `[stop]`，
+    /// 点什么都没反应）。剧情页上的存档不受影响：那里本来就是最外层停驻。
+    std::string stable_script_;
+    size_t stable_line_ = 0;
+    bool page_printed_since_park_ = false;
+    /// 正在执行 Lua 侧的 `tags.<tag>` 处理器（`[load_broken]` 这类）。
+    /// 这期间 `e:tag{"return"}` 必须**立即**弹帧（原版 e:tag 的语义）：
+    /// 排进队列的话，处理器随后排的 `[call ...]` 会把回程点记在当前（UI）
+    /// 脚本上，收尾链就停死在 ui.asb 的 `[stop]`（test13 存档后点不动）。
+    bool in_lua_tag_handler_ = false;
     std::vector<CallFrame> call_stack_;
     bool arrived_by_jump_ = false;
     bool last_wait_from_queue_ = false;
     bool queued_saw_call_ = false;
     bool queued_saw_jump_ = false;
-    /// While non-zero, the queued-tag drain is held: a queued [call] handed
-    size_t queue_hold_depth_ = 0;
-    size_t return_floor_ = 0;
+    /// **队列归帧**：第 i 层（0 = 剧本顶层）还没跑完的 tag。当前层是
+    /// `tag_queue_`；压帧时当前层的队列存进这里，弹帧时取回。
+    ///
+    /// 这一条替换了旧的 `queue_hold_depth_`：队列 [call] 之后的 tag 属于调用者，
+    /// 它们留在调用者那一层，被调方看不到，也就不需要"顶住排空"的全局状态。
+    /// tag 永远在它被排下的那一层排空，不会再拿被调方的脚本解析 label。
+    std::vector<std::vector<Instruction>> queue_stack_;
     int immediate_tag_depth_ = 0;
-    /// True when the last run() ended by yielding a wait/stop to the host.
-    /// queue_hold_depth_ is released on that edge (see flush_tag_queue).
-    bool parked_ = false;
     // Call-frame identity source (see CallFrame::id).
     uint64_t next_frame_id_ = 1;
     // Macro tag -> defining file ([macroadd]); see macros().
@@ -786,7 +853,12 @@ private:
     /// get_fontsize, line/backlog measuring). Run the queued message-text
     /// tags ahead of the query so it measures the intended layer; stops at
     /// the first non-text tag (waits/control never pre-execute).
+public:
+    /// 把排队中的文本标签立即落地（`e:var system=get_layer_info` 之类的
+    /// 宿主查询要在"这一帧的写入"之后读，否则拿到上一帧的值）。
     void flush_pending_text_tags();
+
+private:
     void note_wait_reason(const Event& event);
     const oa::runtime::Value* lookup_var_ptr(const std::string& name) const;
     oa::runtime::LuaHost build_lua_host();

@@ -44,6 +44,9 @@ struct LuaHost {
     /// the engine cannot run it inline (control flow / not wired) so the Lua
     /// side falls back to the deferred queue.
     std::function<bool(const std::string&, std::map<std::string, std::string>)> run_tag_now;
+    /// `e:tag{"return"}` 在事件处理会话里 = 框架的 ReturnStack：立即收掉这一层
+    /// （原版 e:tag 就是立即执行）。返回 false = 没有会话，走普通 tag 路径。
+    std::function<bool()> handler_return;
     /// Sync Lua-originated e:tag{"calllua",...} dispatch.
     std::function<bool(const std::string& function,
                        const std::map<std::string, std::string>& params)>
