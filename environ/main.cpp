@@ -57,6 +57,20 @@ struct HostState {
     float pending_y = 0.0f;
 };
 
+// 日志时间戳。
+std::string local_stamp()
+{
+    char stamp[32] = "";
+    const std::time_t now = std::time(nullptr);
+    std::tm tmv{};
+#if defined(_WIN32)
+    if (localtime_s(&tmv, &now) == 0) std::strftime(stamp, sizeof(stamp), "%F %T", &tmv);
+#else
+    if (localtime_r(&now, &tmv) != nullptr) std::strftime(stamp, sizeof(stamp), "%F %T", &tmv);
+#endif
+    return stamp;
+}
+
 // 引擎不认识的指令：写日志 + 提示一次。
 //
 // 静默吞掉的后果是"页面出来了但没字""按钮点了没反应"这类哑故障 ——
@@ -95,12 +109,9 @@ void report_unknown_tags(HostState* host)
     }
     if (!log_path.empty()) {
         if (std::FILE* f = std::fopen(log_path.c_str(), "a")) {
-            char stamp[32] = "";
-            const std::time_t now = std::time(nullptr);
-            std::tm tmv{};
-            if (localtime_s(&tmv, &now) == 0) std::strftime(stamp, sizeof(stamp), "%F %T", &tmv);
+            const std::string stamp = local_stamp();
             for (const std::string& name : fresh)
-                std::fprintf(f, "[%s] unknown tag: %s (at %s)\n", stamp, name.c_str(),
+                std::fprintf(f, "[%s] unknown tag: %s (at %s)\n", stamp.c_str(), name.c_str(),
                              where.c_str());
             std::fclose(f);
         }
@@ -147,11 +158,8 @@ void report_fatal_error(HostState* host)
     }
     if (!log_path.empty()) {
         if (std::FILE* f = std::fopen(log_path.c_str(), "a")) {
-            char stamp[32] = "";
-            const std::time_t now = std::time(nullptr);
-            std::tm tmv{};
-            if (localtime_s(&tmv, &now) == 0) std::strftime(stamp, sizeof(stamp), "%F %T", &tmv);
-            std::fprintf(f, "[%s] %s%s%s\n", stamp, what.c_str(), where.empty() ? "" : " @ ",
+            const std::string stamp = local_stamp();
+            std::fprintf(f, "[%s] %s%s%s\n", stamp.c_str(), what.c_str(), where.empty() ? "" : " @ ",
                          where.c_str());
             std::fclose(f);
         }
