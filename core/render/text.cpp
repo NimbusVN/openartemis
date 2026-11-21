@@ -48,17 +48,6 @@ static bool parse_dbl(std::string_view v, double* out) {
     return true;
 }
 
-static std::string escape_attr(const std::string& v) {
-    std::string r;
-    r.reserve(v.size());
-    for (char c : v) {
-        if (c == '\\') r += "\\\\";
-        else if (c == '"') r += "\\\"";
-        else r += c;
-    }
-    return r;
-}
-
 // FontDesc -------------------------------------------------------------
 const std::string* FontDesc::get(std::string_view key) const {
     const auto it = raw.find(std::string(key));
@@ -106,31 +95,61 @@ void FontDesc::merge_raw(const std::map<std::string, std::string>& p) {
 }
 
 // BacklogTag / BacklogPage ---------------------------------------------
-static std::string build_tag(const std::string& name,
-                                   const std::map<std::string, std::string>& params) {
-    std::vector<std::string> keys;
-    for (const auto& [k, v] : params) keys.push_back(k);
-    std::sort(keys.begin(), keys.end());
-    std::string s = "[" + name;
-    for (const std::string& k : keys) {
-        s += " " + k + "=\"" + escape_attr(params.at(k)) + "\"";
+// 重放命令串：`name,key,val,key,val`。逗号与反斜杠按框架的写法转义
+// （save.iet 自己也是 `gsub("([^\\]),", "%1\\,")`），解释器的 `[tag data]`
+// 解析器负责还原。
+static std::string escape_field(const std::string& v) {
+    std::string r;
+    r.reserve(v.size());
+    for (char c : v) {
+        if (c == '\\') r += "\\\\";
+        else if (c == ',') r += "\\,";
+        else r += c;
     }
-    s += "]";
+    return r;
+}
+
+/// `name` + 参数对。`first` 里的键排在最前面 —— 框架用
+/// `string.find(s, "font,__noreprint,1") == 1`（位置 1 = 串首）识别它们。
+static std::string build_command(const std::string& name,
+                                 const std::map<std::string, std::string>& params,
+                                 std::initializer_list<const char*> first = {}) {
+    std::string s = name;
+    auto emit = [&s](const std::string& k, const std::string& v) {
+        s += "," + k + "," + escape_field(v);
+    };
+    for (const char* k : first) {
+        const auto it = params.find(k);
+        if (it != params.end()) emit(it->first, it->second);
+    }
+    for (const auto& [k, v] : params) {
+        bool skipped = false;
+        for (const char* f : first) {
+            if (k == f) {
+                skipped = true;
+                break;
+            }
+        }
+        if (!skipped) emit(k, v);
+    }
     return s;
 }
 
 std::string BacklogTag::get_string() const {
     switch (kind) {
         case Kind::Text:
-            return "[print data=\"" + escape_attr(text) + "\"]";
+            // 单一语言形态（save.iet 的 saveMakeTagsFromSelectData 也这么写）。
+            return "print,data," + escape_field(text);
         case Kind::LineBreak:
-            return "[rt]";
+            return build_command("rt", params, {"noveldummystart", "noveldummyend"});
         case Kind::Font:
-            return build_tag("font", font);
+            return build_command("font", font, {"__noreprint", "frexname"});
+        case Kind::FontInit:
+            return "fontinit";
         case Kind::RubyStart:
-            return "[ruby text=\"" + escape_attr(text) + "\"]";
+            return "ruby,text," + escape_field(text);
         case Kind::RubyEnd:
-            return "[/ruby]";
+            return "/ruby";
     }
     return "";
 }
@@ -143,7 +162,7 @@ bool BacklogPage::has_text() const {
 std::vector<std::string> BacklogPage::reproduction_tags(bool allfont) const {
     std::vector<std::string> out;
     if (allfont && !page_font.empty()) {
-        out.push_back(build_tag("font", page_font));
+        out.push_back(build_command("font", page_font, {"__noreprint", "frexname"}));
     }
     for (const BacklogTag& t : tags) out.push_back(t.get_string());
     return out;
@@ -278,6 +297,9 @@ void TextEngine::save_profile(const std::string& id, const MessageLayer& l) {
     p.top = l.top;
     p.width = l.width;
     p.height = l.height;
+    p.box_width = l.box_width;
+    p.entire_x = l.entire_x;
+    p.entire_y = l.entire_y;
     p.scetween = l.scetween;
 }
 
@@ -295,8 +317,13 @@ void TextEngine::apply_profile(const std::string& id, MessageLayer* l) {
         l->top = p.top;
         l->width = p.width;
         l->height = p.height;
+        l->entire_x = p.entire_x;
+        l->entire_y = p.entire_y;
         if (l->page_font.empty()) l->page_font = p.font.raw;
     }
+    // 框宽与字体盒独立：positioned 层也可能只有 left/top（width=0），
+    // 这时仍要靠会话里记住的消息窗框宽折行。
+    if (!(l->box_width > 0.0)) l->box_width = p.box_width;
     if (l->scetween.empty()) l->scetween = p.scetween;
 }
 
@@ -331,9 +358,21 @@ static bool is_blank_cp(uint32_t cp);
 void TextEngine::anchor_active_to_content() {
     // 只认"含非空白字形、未隐藏"的内容层；空白测量层（basefont.font0x
     if (!layer_stack_.empty()) return;
+    // 操作界面的文字层（`500.pageno` / `980` / `101.sblock.*`）不是剧情页：
+    // 它们可能比正文更长（980 是存档提示），按"最大 char_count"会把活动层
+    // 抢到提示层上——之后剧本的 print 全打进提示层，正文停在上一页。
+    // 页面/提示根是纯数字（剧情画面根固定是 "1"，`1.80.mw.adv` 不算）。
+    auto numeric_page_root = [](const std::string& id) {
+        const std::string root = id.substr(0, id.find('.'));
+        if (root.empty() || root == "1") return false;
+        for (char c : root)
+            if (c < '0' || c > '9') return false;
+        return true;
+    };
     std::string best;
     size_t best_chars = 0;
     for (const std::string& id : text_ids()) {
+        if (numeric_page_root(id)) continue;
         const MessageLayer* lp = find_text(id);
         if (!lp) continue;
         const MessageLayer& l = *lp;
@@ -454,14 +493,31 @@ void TextEngine::pop_layer() {
 void TextEngine::apply_font(const std::map<std::string, std::string>& p) {
     MessageLayer& l = active_mut();
     // entirexscale / entireyscale: the framework's font rows are authored in an
-    std::map<std::string, std::string> scaled = p;
+    // enlarged font space; size/行距/文本框宽都要乘上这个百分比。字体表是
+    // **分几段**下发的（底座 cn_tag_font.csv 带 entirexscale，角色窗的
+    // cn_tag_font_その他女性.csv 只补 left/top/width/height）。底座把
+    // width 从 1550 缩到 1023 之后，角色窗又把 width=570 原样盖回来 ——
+    // 折行宽度就变成未缩放的整块纹理宽，中文一句话永远不折（test10
+    // s100.txt 的「好棒……」本该 2 行）。因此把当前生效的缩放因子记在层上，
+    // 后续**不带** entirexscale 的分段也按同一因子换算它的排版键。
     double sx = 100.0;
     double sy = 100.0;
-    if (const auto it = p.find("entirexscale"); it != p.end()) parse_dbl(it->second, &sx);
-    if (const auto it = p.find("entireyscale"); it != p.end()) parse_dbl(it->second, &sy);
+    const auto sit_x = p.find("entirexscale");
+    const auto sit_y = p.find("entireyscale");
+    const bool has_sx = sit_x != p.end();
+    const bool has_sy = sit_y != p.end();
+    if (has_sx) parse_dbl(sit_x->second, &sx);
+    if (has_sy) parse_dbl(sit_y->second, &sy);
     if (sx <= 0.0) sx = 100.0;
     if (sy <= 0.0) sy = 100.0;
-    if (sx != 100.0 || sy != 100.0) {
+    if (has_sx) l.entire_x = sx;
+    if (has_sy) l.entire_y = sy;
+    // 本段没有自带 entirexscale 时，沿用层上记住的因子（底座已经缩放过
+    // 一次，这里只对**本段带来的**键再换算一次，不会重复乘）。
+    const double fx = has_sx ? sx : l.entire_x;
+    const double fy = has_sy ? sy : l.entire_y;
+    std::map<std::string, std::string> scaled = p;
+    if (fx != 100.0 || fy != 100.0) {
         auto scale_key = [&](const char* key, double factor) {
             const auto it = scaled.find(key);
             if (it == scaled.end()) return;
@@ -469,16 +525,16 @@ void TextEngine::apply_font(const std::map<std::string, std::string>& p) {
             if (!parse_dbl(it->second, &v)) return;
             it->second = std::to_string(v * factor / 100.0);
         };
-        scale_key("size", sy);
-        scale_key("kerning", sx);
+        scale_key("size", fy);
+        scale_key("kerning", fx);
         // width/height describe the TEXT BOX in the enlarged font space (the
-        scale_key("width", sx);
-        scale_key("height", sy);
-        scale_key("spacetop", sy);
-        scale_key("spacemiddle", sy);
-        scale_key("spacebottom", sy);
-        scale_key("outline", sy);
-        scale_key("rubysize", sy);
+        scale_key("width", fx);
+        scale_key("height", fy);
+        scale_key("spacetop", fy);
+        scale_key("spacemiddle", fy);
+        scale_key("spacebottom", fy);
+        scale_key("outline", fy);
+        scale_key("rubysize", fy);
         scaled["entirexscale"] = "100";
         scaled["entireyscale"] = "100";
     }
@@ -516,9 +572,11 @@ void TextEngine::font_init() {
     MessageLayer& l = active_mut();
     l.font = default_font_;
     l.font_stack.clear();
+    // 框架的 `scenarioRePrint` 以 `fontinit` 作为"正文到此为止"的界标
+    // （`string.find(mes_tag,"fontinit")==1` 就 break）：重放串必须是裸命令，
+    // 不能降级成一条 font 参数表。
     BacklogTag t;
-    t.kind = BacklogTag::Kind::Font;
-    t.font = l.font.raw;
+    t.kind = BacklogTag::Kind::FontInit;
     l.page_tags.push_back(std::move(t));
     save_profile(active_layer_id(), l);
     bump_revision();
@@ -670,7 +728,8 @@ void TextEngine::push_text(const std::string& content) {
     bump_revision();
 }
 
-void TextEngine::line_break(bool omit_blank_line) {
+void TextEngine::line_break(bool omit_blank_line,
+                            const std::map<std::string, std::string>& tag_params) {
     MessageLayer& l = active_mut();
     const bool page_empty = l.page.empty();
     const bool last_is_newline = !l.page.empty() && l.page.back().kind == PageUnit::Kind::Newline;
@@ -681,6 +740,9 @@ void TextEngine::line_break(bool omit_blank_line) {
     l.page.push_back(std::move(u));
     BacklogTag t;
     t.kind = BacklogTag::Kind::LineBreak;
+    t.params = tag_params;
+    // omitblankline 只是引擎侧的排版开关；重放时保留也没有副作用，
+    // 但框架的 dummy 标记必须排在最前（build_command 的 first 规则）。
     l.page_tags.push_back(std::move(t));
     bump_revision();
 }
@@ -693,10 +755,28 @@ void TextEngine::page_break(std::optional<int> backlog_param) {
         return backlog_write_mode_;
     };
     if (should_store()) {
+        // 回顾页跳转重放：这一页已经在表里，只为它办一次"跳过入库"。
+        // 别的层（名字层）的 [rp backlog=0] 不会匹配，标记继续等正文层。
+        bool skip_archive = false;
+        if (skip_archive_ && active_layer_id() == skip_archive_layer_ &&
+            l.generation == skip_archive_generation_) {
+            skip_archive = true;
+            skip_archive_ = false;
+        }
         BacklogPage page;
-        page.page_font = l.page_font;
-        page.tags = l.page_tags;
-        if (!backlog_allow_ || !page.has_text()) {
+            page.page_font = l.page_font;
+            page.tags = l.page_tags;
+            // 回顾表 = 这一页的**重放命令**。跳转时由框架载入自己的存档
+            // 载体并重放/快进，引擎不复制画面。
+        // 入不入库只看 [writebacklog]（should_store）与本页有没有字。
+        //
+        // `[backlog allow=0]` 是**禁用引擎内蔵のバックログUI**（自前 UI を
+        // 持つゲームが必ず呼ぶ：test10 的 backlog.iet *enable 就是这一句），
+        // 不是"别记录"。把它当成记录开关会让自前バックログ永远拿到
+        // get_backlog_size=0 ⇒ 点 LOG 只弹出"没有回顾"的提示，页面不出现。
+        if (skip_archive) {
+            // 重放页：表里已经有了，不重复入库。
+        } else if (!page.has_text()) {
             // 不入库
         } else {
             if (!backlog_include_font_) {
@@ -704,7 +784,8 @@ void TextEngine::page_break(std::optional<int> backlog_param) {
                 page.tags.erase(
                     std::remove_if(page.tags.begin(), page.tags.end(),
                                    [](const BacklogTag& t) {
-                                       return t.kind == BacklogTag::Kind::Font;
+                                       return t.kind == BacklogTag::Kind::Font ||
+                                              t.kind == BacklogTag::Kind::FontInit;
                                    }),
                     page.tags.end());
             }
@@ -769,6 +850,15 @@ void TextEngine::set_prohibit(const std::string& head, const std::string& foot) 
 }
 void TextEngine::set_wordparts(const std::string& parts) { layout_cfg_.wordparts = parts; }
 void TextEngine::set_indent(const std::string& pair) { layout_cfg_.indent_pair = pair; }
+
+void TextEngine::set_message_box_width(const std::string& id, double w) {
+    MessageLayer* l = find_text(id);
+    if (!l) return;
+    if (l->box_width == w) return;
+    l->box_width = w;
+    save_profile(id, *l);
+    bump_revision();
+}
 
 namespace {
 /// 这一层当前生效的"入场逐字间隔"（毫秒/字）。0 = 瞬时。
@@ -1114,8 +1204,19 @@ LaidPage layout_page(const MessageLayer& layer, const MetricsFn& metrics,
     const double spacebottom = layer.font.spacebottom();
     out.line_height = std::max(1.0, spacetop + ruby_height + spacemiddle + body_height + spacebottom);
 
-    const bool unbounded = layer.width <= 0.0;
-    const double line_width = layer.width > 0.0 ? layer.width : 1.0e18;
+    // 折行宽度 = 消息窗**文本区**宽，而不是整块图像纹理宽。取值优先级：
+    //   1) 字体表显式文本宽（layer.width，[font width=]，CSV 的 width）；
+    //   2) 绑定节点框宽（layer.box_width，宿主按消息窗纹理/裁剪宽扣掉左右
+    //      内边距后写入）；
+    //   3) 舞台宽 − 文本左偏移（纯兜底，避免无字体表的孤儿层退化成 1e18）。
+    // 0/负值一律视为“该来源没给”，继续往下掉。
+    double wrap_width = layer.width;
+    if (!(wrap_width > 0.0)) wrap_width = layer.box_width;
+    if (!(wrap_width > 0.0) && cfg.stage_width > 0.0)
+        wrap_width = cfg.stage_width - std::max(0.0, layer.left);
+    if (!(wrap_width > 0.0)) wrap_width = 1.0e18;
+    const bool unbounded = wrap_width >= 1.0e17;
+    const double line_width = wrap_width;
     const std::vector<uint32_t> pair_cps = cps_of(cfg.indent_pair);
     auto indent_close_of = [&pair_cps](uint32_t c) -> std::optional<uint32_t> {
         for (size_t k = 0; k + 1 < pair_cps.size(); k += 2) {
@@ -1142,7 +1243,8 @@ LaidPage layout_page(const MessageLayer& layer, const MetricsFn& metrics,
                 forced = true;
                 break;
             }
-            if (!unbounded && cx + g.width > line_width && i > line_start) {
+            if (!unbounded && g.width > 0.0 && cx + g.advance > line_width &&
+                i > line_start) {
                 if (contains_cp(cfg.prohibit_head, g.cp)) {
                     cx += g.advance;
                     ++i;
@@ -1207,10 +1309,10 @@ LaidPage layout_page(const MessageLayer& layer, const MetricsFn& metrics,
     // 行对齐（align_layout）：align 键 center/right/
     // equalize 时按行内容宽（首字形 x .. 末字形 x+advance）对行宽居中/右/均排。
     // 仅当层宽 >0 且当前层字体声明了非左对齐时生效（TextAlignment::from）。
-    if (!out.glyphs.empty() && layer.width > 0.0) {
+    if (!out.glyphs.empty() && !unbounded) {
         const std::string align = layer.font.get_or("align", "left");
         if (align != "left" && !align.empty()) {
-            const double lw = layer.width;
+            const double lw = wrap_width;
             // 收集每行非换行字形的首/末下标
             std::map<uint32_t, std::pair<size_t, size_t>> line_bounds; // first,last
             for (size_t i = 0; i < out.glyphs.size(); ++i) {

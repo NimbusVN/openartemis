@@ -18,10 +18,31 @@
 
 namespace oa::runtime {
 
+/// 框架/引擎脚本（不是"剧情正文脚本"）。
+///
+/// 两类：
+///   * `system/...`（iMel/FPM 的宏、按钮、存档页）；
+///   * `scenario/` **直属** 的 `.asb`（Artemis 的 asbmacro/asbscript 引擎层；
+///     t13 的正文在 `scenario/main/*.asb` 子目录里）。
+/// 页锚点/页状态必须是剧情脚本；落到这两类上会把读档位置带进框架宏。
+inline bool is_framework_script(std::string_view name) {
+    if (name.rfind("system/", 0) == 0 || name.find("/system/") != std::string_view::npos)
+        return true;
+    constexpr std::string_view kScenario = "scenario/";
+    if (name.rfind(kScenario, 0) == 0) {
+        const std::string_view rest = name.substr(kScenario.size());
+        if (rest.find('/') == std::string_view::npos) {
+            const size_t dot = rest.rfind('.');
+            const std::string_view ext = dot == std::string_view::npos ? rest : rest.substr(dot);
+            if (ext == ".asb") return true;
+        }
+    }
+    return false;
+}
+
 // ---------------------------------------------------------------------------
 // values — Value + VariableStore
-// ---------------------------------------------------------------------------
-// Artemis variable Value + VariableStore (value conversions, four domains,
+// ---------------------------------------------------------------------------// Artemis variable Value + VariableStore (value conversions, four domains,
 // prefix routing).
 enum class ValueKind { Int, Float, String, Bool, Null };
 
@@ -170,6 +191,11 @@ struct Instruction {
     /// 关 UI 时没有地板，该弹就弹。`kNoFloor` = 不设限。
     static constexpr size_t kNoFloor = static_cast<size_t>(-1);
     size_t floor_depth = kNoFloor;
+    /// 这条排队 tag 来自**tag filter 内部**的 e:tag/e:enqueueTag 时置位：
+    /// 过滤器用它自己把"真正的命令"重新投递一次，不能再被过滤器接住
+    /// （trans 过滤器就会 `param[1]="trans"` 后重新入队）。置位的 tag 还会
+    /// 由 splice_filter_emitted 原位插回队首，保持"顶替被接住的那条"的语义。
+    bool skip_filter = false;
 
     const std::string* get(std::string_view key) const {
         const auto it = params.find(std::string(key));
@@ -244,14 +270,6 @@ struct ScriptError : std::runtime_error {
 /// 先成立即结束停驻；需要清理演出的 wake（video/se/tween/trans）在放行前
 /// 执行自己的 stop 动作，然后才继续脚本。
 struct Wait {
-    /// 能释放这次停驻的输入策略（规格视图）。
-    enum Release : uint32_t {
-        OnClick = 1u << 0,  // 物理点击
-        OnDecide = 1u << 1, // 脚本 decide 边缘（setexclick / overrideKey）
-        OnSkip = 1u << 2,   // 跳过：skip 模式
-        OnAuto = 1u << 4,   // 自动模式计时
-    };
-
     /// 阻塞式演出：完成后才放行（点击/跳过可让它提前结束）。
     enum class Stage {
         None,
@@ -263,8 +281,9 @@ struct Wait {
         Tween,      // [lytween sync=1]
     };
 
-    /// 实际 wake 集合。
-    /// click/decide/skip/auto/timeout/reveal/trans/movie/se/action/...
+    /// 这个停驻能被什么放行。**只有这一份**：构造时直接写，武装时
+    /// normalize_wait() 只会补演出/时钟类（trans/video/timer…）。
+    /// 旧的 `release` 规格位已删除 —— 两套位集是两套真值，改一处永远漏一处。
     enum Wake : uint32_t {
         WakeClick = 1u << 0,
         WakeDecide = 1u << 1,
@@ -285,7 +304,7 @@ struct Wait {
     };
 
     // ---- 规格视图（tag 构造 / 探针 / 存档身份）----
-    uint32_t release = OnSkip;
+    uint32_t wakes = WakeSkip; // 默认：跳过可以放行一切停驻
     /// 请求的计时毫秒；-1 表示没有计时器。0 是合法时长（下一帧放行）。
     /// 注意：这是**请求值**，不再在查询时递减；实际到点看 deadline_ms。
     int64_t timer_ms = -1;
@@ -301,7 +320,6 @@ struct Wait {
     uint64_t se_time_ms = 0;
 
     // ---- 运行态（武装时填充）----
-    uint32_t wakes = 0;
     std::string wake_id;          // Se / VideoLayer / Tween / Custom 的目标
     std::vector<std::string> tween_ids; // [tweenset] 组内多个 sync 目标
     uint64_t deadline_ms = 0;     // WakeTimer 的绝对到点时刻
@@ -323,23 +341,39 @@ struct Wait {
     bool finish_requested = false;
 
     bool has(uint32_t w) const { return (wakes & w) != 0; }
-    bool can(uint32_t r) const { return (release & r) != 0; }
     bool timed() const { return timer_ms >= 0; }
     /// 可以把输入事件标记挂在哪个停驻上：脚本停驻、点击停驻、
     /// 只受跳过控制的计时（普通计时等待本来就在跑，不需要锚点）。
     bool is_input_anchor() const {
-        return is_park() || waiting_click() || (timed() && !can(OnClick));
+        return is_park() || waiting_click() || (timed() && !has(WakeClick));
     }
     /// 一个"等点击"的页（用于点击提示图标）：只受点击/跳过影响的空停驻。
     bool waiting_click() const {
         return stage == Stage::None && !timed() && keys.empty() && !on_reveal_done &&
-               !reveal_clear && can(OnClick);
+               !reveal_clear && has(WakeClick);
     }
     /// 脚本停驻（物理点击不放行）：[stop] 及其演出 gate。
     bool is_park() const {
         return stage != Stage::None ||
-               (!can(OnClick) && !reveal_clear && !on_reveal_done && !timed());
+               (!has(WakeClick) && !reveal_clear && !on_reveal_done && !timed());
     }
+};
+
+/// `[save]` 的执行现场（**只有** save 需要）。
+///
+/// `[save]` 常常是框架 tag filter 里 `e:enqueueTag` 出来的：真正落盘发生在
+/// 队列排空时，那时 `current_line_` 已经是**下一条指令**（iMel 的
+/// `save.iet` 明确把 `[save]` 下一行写成"ロード時はここから再開"）。
+/// 直接把现场记在事件上，宿主就不必再猜"这是哪一页"。
+///
+/// - 剧本里内联的 `[save]`：脚本自己会前进一条 ⇒ line = 当前指令 + 1；
+/// - Lua `e:tag{"save"}`（FPM 的 quicksave）：当场执行 ⇒ line = 当前指令
+///   （读档重新停在这个停驻上）。
+struct SaveOrigin {
+    std::string script;
+    size_t line = 0;
+    std::vector<std::pair<std::string, size_t>> call_stack;
+    size_t story_call_line = 0; ///< 最内层剧情帧的 call_line（见 CallFrame）
 };
 
 struct Event {
@@ -372,6 +406,8 @@ struct Event {
     std::string tag;   // Custom / TextConfig / ConfigEvent / LayerEventCmd
     std::map<std::string, std::string> params;
     std::string id;    // layer / message-layer events
+    /// 仅 save：落盘要用的执行现场（见 SaveOrigin）。
+    std::shared_ptr<const SaveOrigin> save_origin;
 
     static Event park_on(Wait w) {
         Event e;
@@ -428,6 +464,11 @@ struct CallFrame {
     /// 否则 `ReturnStack()` 什么都不做，UI 永远停在 `[stop]`（test13 存档后
     /// 回不到正文就是这个）。
     bool anon = false;
+    /// 压帧时**正在执行的那条指令**（官方 BOWS frame.current）。保存动作发生
+    /// 在框架脚本（save.iet）里时，剧情帧的 return_line 是"这一页之后的
+    /// 指令"，直接回到那里会立刻打印下一页；官方引擎回到这一帧的 current
+    /// （宏调用行），把这一页重新走一遍再停在 [@]。
+    size_t call_line = 0;
 };
 
 // Host-side capability hooks (filled by the engine runtime and its Lua layer).
@@ -606,6 +647,27 @@ public:
     std::vector<Instruction> take_tag_queue();
     void restore_tag_queue(std::vector<Instruction> items);
     size_t queued_tag_count() const { return tag_queue_.size(); }
+    /// 未实现的指令（标签名 → 出现过几次）。宿主拿它提示玩家/写日志：
+    /// 静默吞掉会变成"页面出来了但没字""按钮点了没反应"这种哑故障。
+    const std::map<std::string, int>& unknown_tags() const { return unknown_tags_; }
+    void note_unknown_tag(const std::string& tag) { ++unknown_tags_[tag]; }
+    // ------------------------------------------------------------------
+    // 已读行（既読）——skip 的既读判定（s.status.alreadyread）与已读文字色。
+    //
+    // 键 = 脚本名，值 = 打印过的行号集合。原版把这个表存在全局档（BOWG 的
+    // read_lines：脚本 → 已读行），这里同构：宿主负责把它落到 g.readlines。
+    // note_text_line 返回"这一行之前读过吗"，并在同一拍记入。
+    // ------------------------------------------------------------------
+    bool note_text_line(const std::string& script, size_t line);
+    /// 当前脚本行是正文：判既读 → 写 s.status.alreadyread → 记入表。
+    /// [print] 标签与 Text 行（.iet 的裸文本）两条路都走这里。
+    void note_text_position();
+    bool has_read_line(const std::string& script, size_t line) const;
+    const std::map<std::string, std::set<uint32_t>>& read_lines() const {
+        return read_lines_;
+    }
+    void set_read_lines(std::map<std::string, std::set<uint32_t>> lines);
+    void merge_read_lines(const std::map<std::string, std::vector<uint32_t>>& lines);
     /// Put a parked script tail back in front of the queue (a released park's
     /// deferred tags run before anything enqueued while it was live).
     void prepend_tags(std::vector<Instruction> items) {
@@ -617,6 +679,11 @@ public:
     /// drain that Lua e:enqueueTag uses; the runtime enqueues lytween
     /// completion handlers through it).
     void enqueue_tag(std::string tag, std::map<std::string, std::string> params);
+    /// 把 tag filter 在本次调用里重新投递的命令插回队首（保持投递顺序）。
+    /// 过滤器是"原位替换"：它排下的真命令要顶替被它接住的那条，不能排到
+    /// 调用者剩余队列之后（sysbtn 的子菜单：队列里还排着别的 tag，转场跑到
+    /// 它们后面就会打乱标题/菜单流程）。
+    void splice_filter_emitted();
     /// Whether the tag queue holds pending tags.
     bool has_queued_tags() const { return !tag_queue_.empty(); }
     /// Macro registry: [macroadd file=F] registers every label of F as a
@@ -689,24 +756,116 @@ public:
     void enter_lua_tag_handler() { in_lua_tag_handler_ = true; }
     void leave_lua_tag_handler() { in_lua_tag_handler_ = false; }
 
-    /// 有文字页被画出来：记这一行（深 0 才记，宏里的 print 不算剧情位置）。
-    /// 读档从这一行恢复 = 把玩家看到的那一页重新画一遍。
-    void note_page_printed() {
-        if (!call_stack_.empty() || !current_script_name_) return;
+    /// 这一页的**脚本起点**（第一条源码指令 + 调用栈）。
+    ///
+    /// 存档动作发生在框架脚本（save.iet）里时，精确位置是"存档页的收尾"；
+    /// 直接回到它，剧情帧已经越过了这一页的 [@]。官方 BOWS 把帧的
+    /// current/pending 一起存下来；本引擎只存**这一页的源码起点**：读档后
+    /// 脚本把这一页重放一遍，自然停在页尾的 [@]（画面/文本由存档的
+    /// surface 恢复，页前的 [bg]/[chgmsg] 不需要重跑）。
+    ///
+    /// 只记**新页第一段文字**之前的那条源码行；不存任何画面快照。
+    void note_page_start(std::string_view layer = {}) {
+        if (!current_script_name_) return;
+        const auto is_system = [](const std::string& s) {
+            return is_framework_script(s);
+        };
+        std::string script = *current_script_name_;
+        size_t line = current_line_;
+        std::vector<CallFrame> stack = call_stack_;
+        if (is_system(script)) {
+            for (size_t i = call_stack_.size(); i-- > 0;) {
+                const CallFrame& f = call_stack_[i];
+                if (f.script.empty() || is_system(f.script)) continue;
+                script = f.script;
+                line = f.call_line ? f.call_line : (f.return_line > 0 ? f.return_line - 1 : 0);
+                stack.assign(call_stack_.begin(), call_stack_.begin() + i);
+                break;
+            }
+        }
+        if (is_system(script)) return;
+        // 退到同一源码行的首指令（[lang] / [font] 这类前置 tag 一起重放）。
+        if (const Script* s = get_script(script)) {
+            if (line < s->instructions.size()) {
+                const size_t src = s->instructions[line].line;
+                while (line > 0 && s->instructions[line - 1].line == src) --line;
+            }
+        }
+        page_start_script_ = std::move(script);
+        page_start_line_ = line;
+        page_start_stack_ = std::move(stack);
+        page_start_valid_ = true;
+        ++page_start_serial_;
+    }
+    bool page_start_valid() const { return page_start_valid_; }
+    uint64_t page_start_serial() const { return page_start_serial_; }
+    const std::string& page_start_script() const { return page_start_script_; }
+    size_t page_start_line() const { return page_start_line_; }
+    const std::vector<CallFrame>& page_start_stack() const { return page_start_stack_; }
+    /// 这一页的**重放起点** = 产生页首文字的那条源码行的第一条指令。
+    /// 只在新页第一段文字时调用（宿主在 push_text 之前判断）。
+    void note_page_printed(std::string_view layer = {}) {
+        if (!current_script_name_) return;
+        const auto is_system = [](const std::string& s) {
+            return is_framework_script(s);
+        };
+        std::string script = *current_script_name_;
+        size_t line = current_line_;
+        std::vector<CallFrame> stack = call_stack_;
+        if (is_system(script)) {
+            for (size_t i = call_stack_.size(); i-- > 0;) {
+                const CallFrame& f = call_stack_[i];
+                if (f.script.empty() || is_system(f.script)) continue;
+                script = f.script;
+                line = f.call_line ? f.call_line : (f.return_line > 0 ? f.return_line - 1 : 0);
+                stack.assign(call_stack_.begin(), call_stack_.begin() + i);
+                break;
+            }
+        }
+        if (is_system(script)) return;
+        if (const Script* s = get_script(script)) {
+            if (line < s->instructions.size()) {
+                const size_t src = s->instructions[line].line;
+                while (line > 0 && s->instructions[line - 1].line == src) --line;
+            }
+        }
+        page_anchor_script_ = std::move(script);
+        page_anchor_line_ = line;
+        page_anchor_stack_ = std::move(stack);
+        page_anchor_layer_.assign(layer);
+        page_anchor_valid_ = true;
+        // 页首的变量（含 t.*）：存档发生在 save.iet 里时用它，避免把存档页
+        // 的 UI scratch（t.sysbtn_submenu / backlog.num / meswindow.*）写进档。
+        page_start_vars_ = variables_.local;
+        for (const auto& [k, v] : variables_.temp) page_start_vars_[k] = v;
+    }
+    const std::map<std::string, Value>& page_start_vars() const { return page_start_vars_; }
+    bool page_anchor_valid() const { return page_anchor_valid_; }
+    const std::string& page_anchor_script() const { return page_anchor_script_; }
+    size_t page_anchor_line() const { return page_anchor_line_; }
+    const std::vector<CallFrame>& page_anchor_stack() const { return page_anchor_stack_; }
+    const std::string& page_anchor_layer() const { return page_anchor_layer_; }
+    void clear_page_anchor() { page_anchor_valid_ = false; }
+    /// 停驻这一刻记位置（诊断/稳定停驻查询）。
+    void note_stable_park() {
+        if (!current_script_name_) return;
         stable_script_ = *current_script_name_;
         stable_line_ = current_line_;
-        page_printed_since_park_ = true;
     }
-    /// 停驻这一刻记位置。文字页已经记过就不覆盖：`[print]` 之后紧跟的
-    /// `[click]` 只是等输入，从 print 行恢复才能重现同一页。
-    void note_stable_park() {
-        if (!call_stack_.empty() || !current_script_name_) return;
-        if (!page_printed_since_park_) {
-            stable_script_ = *current_script_name_;
-            stable_line_ = current_line_;
-        }
-        page_printed_since_park_ = false;
-    }
+    /// 无 file 的 `[call label]` / `[jump label]` 的标签解析规则。
+    ///
+    /// 命名空间 = **当前脚本 + 框架脚本**（`system/*` 与 `scenario/*.asb`
+    /// 这类框架层，见 is_framework_script）。iMel 的 `config_s.iet` 顶部
+    /// 写着"config.iet 必須"，并直接 `[call label="mw_reprop"]` /
+    /// `delete_config_sample_mes` —— 这些标签只存在于 config.iet，属于框架
+    /// 自己的**跨页命名空间**，不是"随手到处找"。
+    ///
+    /// 不搜索剧情脚本：剧情文件缺标签仍是作者错误，不能静默跳到别的剧本。
+    /// 顺序固定：当前脚本 → 框架脚本（按文件名稳定排序）。
+    bool resolve_label(const std::string& label, std::string* file, size_t* line) const;
+    /// 以 `context` 为发起脚本的同一套解析（排队 tag 用 origin_script）。
+    bool resolve_label_from(const std::string& context, const std::string& label,
+                            std::string* file, size_t* line) const;
     VariableStore& variables() { return variables_; }
     const VariableStore& variables() const { return variables_; }
     void set_variable(const std::string& name, Value v) { variables_.set(name, std::move(v)); }
@@ -719,6 +878,12 @@ public:
     bool apply_var(const std::map<std::string, std::string>& params);
     /// Fire a registered event handler (e.g. onEnterFrame -> Lua vsync).
     bool fire_event(const std::string& event_name);
+    /// 带参数触发框架注册的事件处理器（`e:setEventHandler{ onSave = "store" }`
+    /// / `onLoad = "restore"` / iMel 的 `setOnSave`/`setOnLoad`）。处理器签名
+    /// 与 `calllua` 相同：(e, param)。这是框架**声明自己要存什么/恢复什么**
+    /// 的唯一入口 —— 引擎不再硬编码 `store`/`restore` 这两个名字。
+    bool fire_event(const std::string& event_name,
+                    const std::map<std::string, std::string>& params);
     /// `e:tag{...}` from Lua executes the tag NOW (Artemis semantics), unlike
     /// `e:enqueueTag` which defers. Only presentation tags are accepted here;
     /// control-flow outcomes return false so the caller can queue the tag and
@@ -734,9 +899,9 @@ public:
     bool dispatch_text_row_to_print_filter(const std::string& text);
 
     /// e:getScriptBlock backing: tag row at script : instruction index
-    /// (command = tag name, parameter = raw params). nullopt when the script
-    /// is unknown or the index is out of range.
-    std::optional<std::pair<std::string, std::map<std::string, std::string>>>
+    /// (command/parameter/源码行号). nullopt when the script is unknown or the
+    /// index is out of range.
+    std::optional<oa::runtime::LuaHost::ScriptBlock>
     script_block(const std::string& file, size_t index) const;
     /// Resolve a logical file name through the magic-path table
     /// (e:setMagicPath, ":bg/" prefixes etc).
@@ -785,16 +950,27 @@ private:
     bool line_tags_loaded_ = false;
     std::optional<std::string> current_script_name_;
     size_t current_line_ = 0;
-    /// 最近一次**最外层停驻**的位置（调用栈为空时的 `[stop]`/`[@]` 所在行）。
+    /// 打印过的行（脚本 → 行号）；见 note_text_line。
+    std::map<std::string, std::set<uint32_t>> read_lines_;
+    /// 最近一次停驻的位置（诊断/框架查询用）。
     ///
-    /// 存档用它当恢复点。存档动作几乎总发生在宏/UI 调用里
-    /// （`adv_save` → `save_write` → `[save]`，中间还夹着 `attack_check`），
-    /// 这时 `current_script_name_` 是 system.iet 的宏体；照它存档，读档后会在
-    /// 宏中间接着跑，剧情再也接不上（test13：读档后卡在 ui.asb 的 `[stop]`，
-    /// 点什么都没反应）。剧情页上的存档不受影响：那里本来就是最外层停驻。
+    /// **存档不再用它**：存档保存的是执行现场本身（`[save]` 事件带
+    /// SaveOrigin；宿主自动存档用当前停驻）。早期把它当"恢复点"，结果每种
+    /// 框架都要一套不同的修正，正是本轮删掉的复杂度。
     std::string stable_script_;
     size_t stable_line_ = 0;
-    bool page_printed_since_park_ = false;
+    /// 这一页的脚本起点（见 note_page_start；不存画面）。
+    std::string page_start_script_;
+    size_t page_start_line_ = 0;
+    std::vector<CallFrame> page_start_stack_;
+    bool page_start_valid_ = false;
+    uint64_t page_start_serial_ = 0;
+    std::string page_anchor_script_;
+    size_t page_anchor_line_ = 0;
+    std::vector<CallFrame> page_anchor_stack_;
+    std::string page_anchor_layer_;
+    bool page_anchor_valid_ = false;
+    std::map<std::string, Value> page_start_vars_;
     /// 正在执行 Lua 侧的 `tags.<tag>` 处理器（`[load_broken]` 这类）。
     /// 这期间 `e:tag{"return"}` 必须**立即**弹帧（原版 e:tag 的语义）：
     /// 排进队列的话，处理器随后排的 `[call ...]` 会把回程点记在当前（UI）
@@ -828,6 +1004,10 @@ private:
     std::map<std::pair<std::string, size_t>, bool> executed_lua_blocks_;
     // queue of engine tags enqueued from Lua (drained before inline steps)
     std::vector<Instruction> tag_queue_;
+    /// 引擎不认识的指令（名字 → 次数）。宿主负责提示，别静默吞。
+    std::map<std::string, int> unknown_tags_;
+    /// 当前 tag filter 调用里通过 e:tag/e:enqueueTag 重投递的命令（原位插回）。
+    std::vector<Instruction> filter_emitted_;
     // Lua-side event handlers: event name -> global function name
     std::map<std::string, std::string> event_handlers_;
     // e:getScriptWaitReason backing store

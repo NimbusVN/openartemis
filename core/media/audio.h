@@ -146,6 +146,8 @@ public:
     void set_master_volume(float volume);
     void set_bgm_volume(float volume);
     void set_se_volume(float volume);
+    /// 语音总线音量（框架的 s.voicevol 实值；缺省 1.0）。
+    void set_voice_volume(float volume);
     void set_skipping(bool skipping);
     bool is_se_playing(const std::string& id) const;
     bool is_bgm_playing() const;
@@ -273,6 +275,13 @@ public:
     /// dump the OA_AUDIO_DIAG delivery summary (no-op when the
     /// diagnostics never ran). `label` names the dump in the output.
     void print_audio_diag(const char* label) const;
+
+    /// 只读：一路通道的解码进度（测试/诊断）。`cat` + `id` 与 play_* 的通道键
+    /// 一致（BGM 传 id=""）。返回 false = 当前没有这路通道。`seconds` 是解码器
+    /// 已经产出的逻辑源时长——无头（没有音频设备）时它就是"真的在解码"的证据；
+    /// `unplayable` = 文件打不开或不是可解的 vorbis。
+    bool decode_progress(SoundCategory cat, const std::string& id, double* seconds,
+                         bool* unplayable) const;
 
     /// frames queued on one bound device stream (0 without a
     /// device). The queued level IS the audible latency — the device plays

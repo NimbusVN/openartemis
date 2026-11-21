@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <cstdlib>
 #include <deque>
 #include <map>
 #include <set>
@@ -150,6 +151,82 @@ bool GameRuntime::RuntimeState::save_file_exists(const std::string& file) const 
 // system.dat / saveg.dat 上的 OASB 原样不动——见下面 OASB 分支。
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// 既読行（already read）—— g.readlines
+//
+// 形は「1 脚本 1 行」のテキスト表：
+//     <script>\t<line>,<line>,...\n
+// 原版の BOWG も同じ形（脚本 → 既読行の集合）なので、意味はそのまま。
+// 規模は 1 万行でも 100KB 程度で、ドメイン文書の 1 変数に収まる。
+// ---------------------------------------------------------------------------
+namespace {
+
+std::string encode_read_lines(
+    const std::map<std::string, std::set<uint32_t>>& lines) {
+    std::string out;
+    for (const auto& [script, rows] : lines) {
+        if (script.empty() || rows.empty()) continue;
+        out += script;
+        out += '\t';
+        bool first = true;
+        for (const uint32_t row : rows) {
+            if (!first) out += ',';
+            out += std::to_string(row);
+            first = false;
+        }
+        out += '\n';
+    }
+    return out;
+}
+
+std::map<std::string, std::set<uint32_t>> decode_read_lines(const std::string& text) {
+    std::map<std::string, std::set<uint32_t>> out;
+    size_t pos = 0;
+    while (pos < text.size()) {
+        const size_t nl = text.find('\n', pos);
+        const size_t end = nl == std::string::npos ? text.size() : nl;
+        const std::string line = text.substr(pos, end - pos);
+        pos = end + 1;
+        const size_t tab = line.find('\t');
+        if (tab == std::string::npos || tab == 0) continue;
+        const std::string script = line.substr(0, tab);
+        auto& rows = out[script];
+        size_t p = tab + 1;
+        while (p < line.size()) {
+            const size_t comma = line.find(',', p);
+            const size_t stop = comma == std::string::npos ? line.size() : comma;
+            if (stop > p) {
+                try {
+                    rows.insert(static_cast<uint32_t>(std::stoul(line.substr(p, stop - p))));
+                } catch (const std::exception&) {
+                    // 壊れた 1 行は捨てる（表全体を失うよりまし）
+                }
+            }
+            if (comma == std::string::npos) break;
+            p = comma + 1;
+        }
+    }
+    return out;
+}
+
+} // namespace
+
+void GameRuntime::RuntimeState::load_read_state() {
+    if (!interpreter_) return;
+    const auto v = interpreter_->variables().get("g.readlines");
+    if (!v || v->kind != oa::runtime::ValueKind::String) return;
+    interpreter_->set_read_lines(decode_read_lines(v->str_val));
+    std::fprintf(stderr, "[runtime] read-state: %zu script(s) loaded\n",
+                 interpreter_->read_lines().size());
+}
+
+void GameRuntime::RuntimeState::save_read_state() {
+    if (!interpreter_) return;
+    interpreter_->set_variable(
+        "g.readlines",
+        oa::runtime::Value::make_string(encode_read_lines(interpreter_->read_lines())));
+}
+
 void GameRuntime::RuntimeState::sysload() {
     if (!save_.save_store_) return;
     struct Slot {
@@ -202,12 +279,12 @@ void GameRuntime::RuntimeState::sysload() {
                                  legacy.c_str(), stats.pluto_failed);
                 }
                 if (!off.read_lines.empty()) {
-                    // 引擎目前没有"已读行"状态存储（skip 不做已读判定），所以
-                    // 只报数量；将来接 skip-read 时这张表就是入口。
+                    // 原版的既読表（BOWG 的 read_lines）直接并进本引擎的
+                    // 已读表：官方存档里的"读过"进度不能丢。
+                    interpreter_->merge_read_lines(off.read_lines);
                     std::fprintf(stderr,
-                                 "[runtime] sysload %s: %zu script(s) / %zu read-line(s) in "
-                                 "the official progress table (not applied: the engine keeps "
-                                 "no read state)\n",
+                                 "[runtime] sysload %s: %zu script(s) / %zu read-line(s) "
+                                 "merged into the read table\n",
                                  legacy.c_str(), off.read_lines.size(), stats.read_lines);
                 }
             } catch (const std::exception& e) {
@@ -238,6 +315,7 @@ bool GameRuntime::RuntimeState::syssave() {
     // 数据里 `[system_save]` 总是排在 `[save]` 前面，所以这里**不要**再调一次
     // 游戏的落盘函数——那会重复弹通知、重复写盘。
     if (!save_.save_store_ || !interpreter_) return false;
+    save_read_state(); // 既読表 → g.readlines（global 域として落ちる）
     const auto& vars = interpreter_->variables();
     const std::map<std::string, oa::runtime::Value> global(vars.global.begin(),
                                                           vars.global.end());
@@ -251,11 +329,23 @@ bool GameRuntime::RuntimeState::syssave() {
         // Strip the domain prefix off each key.
         std::map<std::string, oa::runtime::Value> stripped;
         for (const auto& [k, v] : m) {
+            // s.status.* 是每帧刷新的瞬态（skip/avoid 标志），不进档：
+            // 下次启动由 sync_control_status 重新摊平。
+            if (k.rfind("s.status.", 0) == 0) continue;
             stripped[k.size() > 2 ? k.substr(2) : k] = v;
         }
         const std::string doc = oa::runtime::encode_domain_map(stripped);
         const std::vector<uint8_t> bytes(doc.begin(), doc.end());
-        if (!save_.save_store_->write(path, bytes)) all_ok = false;
+        // 诊断：路径/条目数只在 OA_SAVE_TRACE 下打印（正常启动不刷屏）。
+        static const bool trace = std::getenv("OA_SAVE_TRACE") != nullptr;
+        if (trace) {
+            std::fprintf(stderr, "[runtime] syssave %s (%zu entries, %zu bytes)\n",
+                         path.c_str(), stripped.size(), bytes.size());
+        }
+        if (!save_.save_store_->write(path, bytes)) {
+            if (trace) std::fprintf(stderr, "[runtime] syssave %s FAILED\n", path.c_str());
+            all_ok = false;
+        }
     };
     write_map(kSavegOaFile, global);
     write_map(kSystemOaFile, system);
@@ -343,10 +433,20 @@ bool under_csv_button_page(const oa::render::Compositor& scene, const std::strin
     }
 }
 
+/// 存档瞬间的**临时 UI**：读档后由框架的收尾重新生成，不属于剧情画面。
+/// 不剔掉它们，读档后会把"1番スロットをロードしました"、渐黑遮罩、存档页
+/// 背景一起盖回剧情上。
+bool is_transient_ui_id(const std::string& id) {
+    const auto at = [&](const char* prefix) { return id.rfind(prefix, 0) == 0; };
+    return id == "980" || at("980.") || id == "nowsaving" || at("loadmask") ||
+           id == "99" || at("99.") || at("101.") || at("1000.") || at("80.") ||
+           id == "110" || at("110.");
+}
+
 } // namespace
 
-void collect_text_snapshot(oa::runtime::SaveData* data, const oa::render::TextEngine& text,
-                           const oa::render::Compositor& scene) {
+void collect_text_snapshot(oa::runtime::PageState* data, const oa::render::TextEngine& text,
+                           const oa::render::Compositor& scene, bool skip_operation_pages = true) {
     data->has_text = true;
     const std::string active = text.active_layer_id();
     for (const auto& [id, mlp] : text.all_layers()) {
@@ -357,7 +457,9 @@ void collect_text_snapshot(oa::runtime::SaveData* data, const oa::render::TextEn
         // 操作界面（csvbtn 预建的 500.bt.N.bg.M 一类的槽位文字）不是画面
         // 上的东西：它们的排版参数是待用的，读档时 ensure_message_scene_node
         // 会把它们复活成可见 —— 那就是"读档后存档页的编号留在了剧情上"。
-        if (under_csv_button_page(scene, id)) continue;
+        if (skip_operation_pages &&
+            (under_csv_button_page(scene, id) || is_transient_ui_id(id)))
+            continue;
         std::string flat;
         for (const auto& u : ml.page) {
             if (u.kind == oa::render::PageUnit::Kind::Newline) flat.push_back('\n');
@@ -369,6 +471,7 @@ void collect_text_snapshot(oa::runtime::SaveData* data, const oa::render::TextEn
         s.id = id;
         s.active = (id == active);
         s.positioned = ml.positioned;
+        s.layered = ml.layered ? 1 : 0;
         s.left = ml.left;
         s.top = ml.top;
         s.width = ml.width;
@@ -384,7 +487,7 @@ void collect_text_snapshot(oa::runtime::SaveData* data, const oa::render::TextEn
 /// The scene snapshot deliberately skips the engine message slots, so the
 /// binding has to be re-made here exactly like the [chgmsg] handler does.
 void restore_text_snapshot(oa::render::TextEngine* text, oa::render::Compositor* scene,
-                           const oa::runtime::SaveData& data) {
+                           const oa::runtime::PageState& data) {
     if (!data.has_text || data.text_layers.empty()) return;
     text->clear_scene();
     std::string active;
@@ -397,7 +500,8 @@ void restore_text_snapshot(oa::render::TextEngine* text, oa::render::Compositor*
             font["width"] = std::to_string(s.width);
             font["height"] = std::to_string(s.height);
         }
-        text->switch_layer(s.id, /*stack=*/false, std::nullopt);
+        text->switch_layer(s.id, /*stack=*/false,
+                           s.layered >= 0 ? std::optional<int>(s.layered) : std::nullopt);
         if (!font.empty()) text->apply_font(font);
         if (!s.text.empty()) {
             text->push_text(s.text);
@@ -418,12 +522,18 @@ void restore_text_snapshot(oa::render::TextEngine* text, oa::render::Compositor*
     }
 }
 
-void collect_scene_snapshot(oa::runtime::SaveData* data, const oa::render::Compositor& scene) {
+void collect_scene_snapshot(oa::runtime::PageState* data, const oa::render::Compositor& scene,
+                            bool skip_operation_pages = true) {
     data->has_scene = true;
     const oa::render::Layer& root = scene.root_props();
     data->root_props = root.props;
     for (const oa::render::Layer* l : scene.draw_order()) {
-        if (under_csv_button_page(scene, l->id)) continue; // 打开中的操作界面不存
+        // 打开中的操作界面不存。**剧情页快照例外**（skip=false）：剧情画面里
+        // 的 dock（根 id `110`）也带 csvbtn 的 `com=` 点击行，按这条规则会被
+        // 整棵剔掉 —— 读档后 dock 永远不出现，玩家进不去存档页（test10）。
+        if (skip_operation_pages &&
+            (under_csv_button_page(scene, l->id) || is_transient_ui_id(l->id)))
+            continue;
         oa::runtime::LayerSnap snap;
         snap.id = l->id;
         snap.props = l->props;
@@ -444,7 +554,86 @@ void collect_scene_snapshot(oa::runtime::SaveData* data, const oa::render::Compo
     }
 }
 
-void collect_audio_snapshot(oa::runtime::SaveData* data, const oa::media::AudioEngine& audio) {
+/// 回顾表：脚本的 `backlog.iet` 通过 `get_backlog_size` / `backlog_tags`
+/// 重建回顾页。存档不带它，读档后回顾页就是空壳（用户报的"回顾没有字"）。
+void collect_backlog_snapshot(oa::runtime::SaveData* data,
+                              const oa::render::TextEngine& text,
+                              bool include_current_page = false) {
+    data->has_backlog = true;
+    data->backlog_write_mode = text.backlog_write_mode();
+    data->backlog_allow = text.backlog_allow();
+    data->backlog.clear();
+    data->backlog.reserve(text.backlog_pages().size());
+    for (const auto& page : text.backlog_pages()) {
+        oa::runtime::BacklogPageSnap bp;
+        bp.page_font = page.page_font;
+        bp.tags.reserve(page.tags.size());
+        for (const auto& t : page.tags) {
+            oa::runtime::BacklogTagSnap ts;
+            ts.kind = int(t.kind);
+            ts.text = t.text;
+            ts.font = t.font;
+            ts.params = t.params;
+            bp.tags.push_back(std::move(ts));
+        }
+        data->backlog.push_back(std::move(bp));
+    }
+    // 当前这一页还没走 `[rp]`（存档/回顾跳转发生在页尾停驻），所以它不在
+    // `backlog_pages()` 里。但"每页的回顾用档"必须包含玩家正看的这一页：
+    // 读档后框架用 `get_backlog_size`/`backlog_tags` 重建回顾页，最后一页
+    // 就是它；框架的 `scenario_reprint` 用 `[rp backlog=0]` 重画这一页，
+    // 不会补一次入库。把当前页按 `[rp]` 入库时的同一形状（page_tags +
+    // page_font）补在表尾，只有表和当前页不一致时才补。
+    if (!include_current_page) return;
+    const std::string active = text.active_layer_id();
+    const oa::render::MessageLayer* ml = text.layer(active);
+    if (ml && !ml->page_tags.empty()) {
+        std::string cur;
+        for (const auto& t : ml->page_tags) cur += t.text;
+        std::string last;
+        if (!data->backlog.empty())
+            for (const auto& t : data->backlog.back().tags) last += t.text;
+        if (!cur.empty() && cur != last) {
+            oa::runtime::BacklogPageSnap bp;
+            bp.page_font = ml->page_font;
+            bp.tags.reserve(ml->page_tags.size());
+            for (const auto& t : ml->page_tags) {
+                oa::runtime::BacklogTagSnap ts;
+                ts.kind = int(t.kind);
+                ts.text = t.text;
+                ts.font = t.font;
+                ts.params = t.params;
+                bp.tags.push_back(std::move(ts));
+            }
+            data->backlog.push_back(std::move(bp));
+        }
+    }
+}
+
+void restore_backlog_snapshot(oa::render::TextEngine* text,
+                              const oa::runtime::SaveData& data) {
+    if (!data.has_backlog) return;
+    std::vector<oa::render::BacklogPage> pages;
+    pages.reserve(data.backlog.size());
+    for (const auto& bp : data.backlog) {
+        oa::render::BacklogPage page;
+        page.page_font = bp.page_font;
+        page.tags.reserve(bp.tags.size());
+        for (const auto& ts : bp.tags) {
+            oa::render::BacklogTag t;
+            t.kind = oa::render::BacklogTag::Kind(ts.kind);
+            t.text = ts.text;
+            t.font = ts.font;
+            t.params = ts.params;
+            page.tags.push_back(std::move(t));
+        }
+        pages.push_back(std::move(page));
+    }
+    text->set_backlog_pages(std::move(pages));
+    text->set_backlog_flags(data.backlog_write_mode, data.backlog_allow);
+}
+
+void collect_audio_snapshot(oa::runtime::PageState* data, const oa::media::AudioEngine& audio) {
     data->has_audio = true;
     const auto& st = audio.state();
     const auto snap_channel = [](const oa::media::SoundChannel& ch) {
@@ -483,10 +672,12 @@ struct SceneRestoreStats {
 };
 
 SceneRestoreStats restore_scene_snapshot(oa::render::Compositor* scene,
-                                        const oa::runtime::SaveData& data) {
+                                        const oa::runtime::PageState& data,
+                                        bool clear_scene = true,
+                                        bool restore_handlers = true) {
     SceneRestoreStats st;
     if (!data.has_scene) return st;
-    scene->clear_scene();
+    if (clear_scene) scene->clear_scene();
     if (!data.root_props.empty()) scene->set_root_props(data.root_props);
     std::set<std::string> seen;
     for (const auto& ls : data.layers) {
@@ -509,8 +700,23 @@ SceneRestoreStats restore_scene_snapshot(oa::render::Compositor* scene,
                          ls.id.c_str());
             continue;
         }
-        scene->create(ls.id, ls.props);
+        if (scene->find(ls.id)) {
+            // merge 模式（onLoad 之后）：保留队列 tag/框架新建的层，只把
+            // 快照里的属性盖回去（消息窗边框、已读图标、dock 按钮状态）。
+            //
+            // **显隐不盖**：快照是在存档/读档界面里取的，那一刻 UI 会把
+            // 消息窗容器（1.80）显式隐藏（msg_hide），而框架的 onLoad 会
+            // 按页面状态重建窗口并把它显回来。把快照里的 visible=0 盖回去
+            // 就等于读档后整条消息窗/按钮栏永久消失（t13 的 auto/skip/
+            // 紧急回避全部点不到）。显隐以 onLoad 重建的结果为准。
+            std::map<std::string, std::string> props = ls.props;
+            props.erase("visible");
+            scene->set_props(ls.id, props);
+        } else {
+            scene->create(ls.id, ls.props);
+        }
         ++st.created;
+        if (!restore_handlers) continue;
         for (const auto& h : ls.handlers) {
             oa::render::LayerEventHandler row;
             row.enabled = h.enabled;
@@ -563,48 +769,140 @@ void restore_audio_snapshot(oa::media::AudioEngine* audio, const oa::runtime::Au
 
 } // namespace
 
-bool GameRuntime::RuntimeState::save_game_to(const std::string& file) {
+bool GameRuntime::RuntimeState::save_game_to(const std::string& file,
+                                            const oa::runtime::SaveOrigin* origin) {
     if (!save_.save_store_ || !interpreter_) return false;
-    // onSave("store", {file}) runs with the tag queue isolated.
+
+    // 1) 框架的 onSave（iMel `setOnSave` / FPM·t13 `store`）先跑：这是框架
+    //    **声明自己还要写什么**的唯一入口（iMel 写 g.latestsave、FPM 把
+    //    lua.scr/qjb/log 落进变量）。它排下的 tag 留在队列里，等这一条
+    //    `[save]` 回到脚本流后按原顺序执行 —— 不能在这里 drain（会在
+    //    run() 内部重入解释器）。
     std::vector<oa::runtime::Instruction> pending = interpreter_->take_tag_queue();
-    {
-        const std::map<std::string, std::string> onsave_params{{"file", file}};
-        // A failing save handler logs and continues.
-        try {
-            (void)interpreter_->lua_bridge().call_function("store", onsave_params);
-        } catch (const oa::runtime::LuaError& e) {
-            interpreter_->lua_bridge().report_dispatch_error("calllua", "store", e.what());
-        }
+    // onSave 写进 local 域的变量（FPM 的 lua.scr/log/qjb、iMel 的 g.latestsave）
+    // 是**存档内容本身**，必须随档落盘。UI 存档下面会用页锚点变量域做底
+    // （避免存档页/dialog 的 scratch 混进来），所以先记下 handler 这一拍
+    // 新增/改写的键，随后覆盖到最终变量表上。
+    const std::map<std::string, oa::runtime::Value> vars_before_on_save =
+        interpreter_->variables().local;
+    (void)interpreter_->fire_event("onSave", {{"file", file}});
+    std::map<std::string, oa::runtime::Value> on_save_vars;
+    for (const auto& [k, v] : interpreter_->variables().local) {
+        const auto prev = vars_before_on_save.find(k);
+        if (prev == vars_before_on_save.end() || !(prev->second == v))
+            on_save_vars.emplace(k, v);
     }
-    (void)drain_tag_queue_bounded("save"); // 有界排空（命中 guard 可观测）
     interpreter_->restore_tag_queue(std::move(pending));
 
     oa::runtime::SaveData data;
-    data.local_variables = interpreter_->variables().local;
-    // 恢复点 = 剧情位置，不是"此刻正在跑的那一条"。
+    // 2) 位置。规则只有一条：**记"从哪条脚本指令重放能回到玩家看到的这一页"**。
     //
-    // `[save]` 是排队执行的，落到这里时脚本几乎总在框架脚本里
-    // （`adv_save` → `save_write` → `[save]`，中间还有 `attack_check`）。
-    // 存当前位置 = 存了一个宏体的中间行：读档后从宏中间接着跑，剧情接不上
-    // （test13 读档后卡在 ui.asb 的 `[stop]`，点什么都没反应）。
-    // 只有当前位置**在框架脚本里**时才改用"最近一次最外层停驻"的位置；
-    // 剧情脚本里的存档（T3/绝大多数游戏）照旧存当前位置 + 调用栈。
-    const std::string* cur = interpreter_->current_script();
-    const bool in_framework_script =
-        cur && (cur->rfind("system/", 0) == 0 || cur->find("/system/") != std::string::npos);
-    if (in_framework_script && !interpreter_->stable_script().empty()) {
-        data.current_script = interpreter_->stable_script();
-        data.current_line = interpreter_->stable_line();
-    } else {
-        if (cur) data.current_script = *cur;
-        data.current_line = interpreter_->current_line();
-        for (const auto& f : interpreter_->call_stack()) {
+    //    a. 剧情页落定（park 活着 / 回顾跳转载体 / 框架 UI 存档）：
+    //       恢复点 = 这一页的**脚本起点**（页锚点：script/line/call_stack）。
+    //       读档从页首重放这一页，停在页尾的 `[@]`；回顾快进也在这一页的
+    //       `backlogjump_countup` 命中目标索引。用停驻行（页尾之后）会让
+    //       快进多走一页。
+    //    b. `[save]` 在框架脚本里但不是页面存档（save.iet 的
+    //       「ロード時はここから再開」）：恢复点 = 执行现场（内联 tag 是
+    //       line+1），读档后框架自己的收尾接着跑。
+    //    c. 其它（宿主自发的精确存档）：当前脚本位置。
+    //
+    //    `backlog_N.dat` 是框架"每页一份"的回顾载体；`save_N.dat` 的
+    //    `[save]` 发生在 save.iet（自己的 UI 流程）里，读档后要按**页面**
+    //    重画窗口，所以两者都走 a。
+    const bool backlog_carrier = file.find("backlog_") != std::string::npos;
+    const bool mel_ui_save =
+        origin && oa::runtime::is_framework_script(origin->script) && !backlog_carrier;
+    const bool story_park_save =
+        interpreter_->page_anchor_valid() &&
+        !oa::runtime::is_framework_script(interpreter_->page_anchor_script());
+    if (story_park_save) {
+        // UI 存档还要在 load 之后重画窗口（见 page_anchor 标记）；回顾载体
+        // 由 skipstart 自己接管，不重复。
+        data.page_anchor = !backlog_carrier;
+        data.current_script = interpreter_->page_anchor_script();
+        data.current_line = interpreter_->page_anchor_line();
+        for (const auto& f : interpreter_->page_anchor_stack())
             data.call_stack.emplace_back(f.script, f.return_line);
-        }
+    } else if (origin && !origin->script.empty()) {
+        data.current_script = origin->script;
+        data.current_line = origin->line;
+        data.call_stack = origin->call_stack;
+        if (oa::runtime::is_framework_script(data.current_script))
+            data.story_call_line = origin->story_call_line;
+    } else if (const std::string* cur = interpreter_->current_script()) {
+        data.current_script = *cur;
+        data.current_line = interpreter_->current_line();
+        for (const auto& f : interpreter_->call_stack())
+            data.call_stack.emplace_back(f.script, f.return_line);
     }
-    collect_scene_snapshot(&data, scene());
+    // 3) 变量：**只有无前缀 local**。g./s. 各有自己的文档（saveg/system），
+    //    t. 是 scratch —— 官方 BOWS 不存它。存了它，t10 读档后 t.saveslot
+    //    非 0，save.iet 会走"保存成功"分支而不是"刚读完档"分支。
+    //
+    //    框架 UI 存档（save.iet 里的 `[save]`）取**页锚点落定时的变量域**：
+    //    此刻的 local 表混着存档页/对话框的 scratch（`meswindow.num` 会变成
+    //    存档页的 MW04，r_voice/mouth_* 停在 UI 上），而读档后框架按这些
+    //    页面变量决定重画哪套窗口。页面档（backlog 载体/宿主停驻存档）本来
+    //    就在页面上，直接用当前域。
+    const bool page_vars_ok = interpreter_->page_anchor_valid() &&
+                              !oa::runtime::is_framework_script(
+                                  interpreter_->page_anchor_script());
+    if (mel_ui_save && page_vars_ok) {
+        data.local_variables = interpreter_->page_start_vars();
+        // 页锚点变量域是"这一页开始时的状态"；onSave 刚写进去的载荷
+        // （lua.scr/log/qjb 等）属于本次存档，不能被页变量盖掉。
+        for (const auto& [k, v] : on_save_vars) data.local_variables[k] = v;
+    } else {
+        data.local_variables = interpreter_->variables().local;
+    }
+    // 这一页的消息窗 id 是页面级配置（`[adv mw="..."]`）。框架读档后用它
+    // 选 sysbtn/窗口图片目录；存档页会临时改写 `meswindow.num`，所以单独
+    // 记一份页面值（不是画面快照，只是一条页面变量）。旧档没有 → 空。
+    if (page_vars_ok) {
+        const auto& pv = interpreter_->page_start_vars();
+        const auto it = pv.find("meswindow.num");
+        if (it != pv.end()) data.page_meswindow = it->second.to_display();
+    }
+    // 4) 画面/文本/音频 = 官方 BOWS 的字段 26/24/25/29（存档格式的一部分，
+    //    读档时原样交还；不是"页快照"）。
+    collect_scene_snapshot(&data, scene(), /*skip_operation_pages=*/true);
+    collect_text_snapshot(&data, text(), scene(), /*skip_operation_pages=*/true);
     collect_audio_snapshot(&data, media_.audio_);
-    collect_text_snapshot(&data, text(), scene());
+    // 回顾跳转载体是"每页一份"：它必须把玩家正看的这一页也算进表尾。
+    // 普通存档沿用框架已经归档的回顾表（多补一份会让读档后的表多一页）。
+    collect_backlog_snapshot(&data, text(), backlog_carrier);
+
+    if (std::getenv("OA_SAVE_TRACE")) {
+        std::fprintf(stderr,
+                     "[runtime] save data: scene=%d layers=%zu text=%d textlayers=%zu "
+                     "vars=%zu @ %s:%zu\n",
+                     int(data.has_scene), data.layers.size(), int(data.has_text),
+                     data.text_layers.size(), data.local_variables.size(),
+                     data.current_script.c_str(), data.current_line);
+        std::fprintf(stderr, "[runtime] story_call_line=%zu\n", data.story_call_line);
+        if (const auto* w = current_wait())
+            std::fprintf(stderr, "[runtime] save wait owner=%s:%zu click=%d\n",
+                         w->owner_script.c_str(), w->owner_line, int(w->waiting_click()));
+        for (size_t i = 0; i < park_stack_.size(); ++i) {
+            const auto& pc = park_stack_[i];
+            if (!pc.wait) continue;
+            std::fprintf(stderr, "[runtime] save park_stack[%zu] owner=%s:%zu click=%d\n", i,
+                         pc.wait->owner_script.c_str(), pc.wait->owner_line,
+                         int(pc.wait->waiting_click()));
+        }
+        std::fprintf(stderr, "[runtime] save stable=%s:%zu\n",
+                     interpreter_->stable_script().c_str(), interpreter_->stable_line());
+        if (const oa::runtime::Script* sc = interpreter_->get_script(data.current_script)) {
+            if (data.current_line < sc->instructions.size()) {
+                const auto& ins = sc->instructions[data.current_line];
+                std::fprintf(stderr, "[runtime] save resume instruction: src=%zu tag=%s\n",
+                             ins.line, ins.tag.c_str());
+            }
+        }
+        for (const auto& [fs, fl] : data.call_stack)
+            std::fprintf(stderr, "[runtime] save frame: %s:%zu\n", fs.c_str(), fl);
+    }
     const std::string doc = data.encode();
     const std::string path = qualify_save_file(file);
     if (path.empty()) {
@@ -618,8 +916,6 @@ bool GameRuntime::RuntimeState::save_game_to(const std::string& file) {
     std::fprintf(stderr, "[runtime] saved %s (%zu local vars, script %s:%zu)\n",
                  path.c_str(), data.local_variables.size(), data.current_script.c_str(),
                  data.current_line);
-    // 系统数据不再由引擎补写：onSave 处理器（iMel: store()）自己决定要落什么
-    // （scr/log/qjb 进存档，sys/gscr 走 system_save）。引擎再补一次只会多写一遍。
     return true;
 }
 
@@ -850,19 +1146,54 @@ LoadResult GameRuntime::RuntimeState::load_game(const std::string& file, int64_t
 
     // [C] 桶读档清场（逐项见 reset_ephemeral_on_load）。
     const size_t cleared = reset_ephemeral_on_load();
-
-    const SceneRestoreStats rst = restore_scene_snapshot(&scene(), data);
-    renderer_.request_repaint();
+    // 回顾表不属于"打开着的 UI"，是读过的剧情行：整份还原（含
+    // writebacklog 开关，否则读档后新页不再入表，回顾页永远停在旧内容）。
+    restore_backlog_snapshot(&text(), data);
+    // 场景先按快照装一次：② 桶保留的、读档前排下的 tag（FPM 的 estag 链）
+    // 会在这之后立刻执行，它们必须能看到恢复后的场景（save_compat S7）。
+    // onLoad 之后还会再装一次（框架会重建消息窗/dock）。
+    // ASB/Lua 框架的 bar/按钮 handler 必须由 onLoad 重新注册；快照里的
+    // 旧 handler 绑定的是已经结束的 Lua 会话（t13 auto/skip 点不动）。
+    // iMel（system/msg.iet）的按钮 handler 是脚本行，恢复它可以让场景立即可用；
+    // ASB/Lua 框架的 handler 绑定已经结束的 Lua 会话，必须由 onLoad 重新注册。
+    const bool mel_pages = interpreter_->get_script("system/msg.iet") != nullptr ||
+                           interpreter_->get_script("system/config.iet") != nullptr;
+    SceneRestoreStats rst = restore_scene_snapshot(
+        &scene(), data, /*clear_scene=*/true, /*restore_handlers=*/mel_pages);
     for (const auto& [k, row] : live_input) {
         scene().restore_input_row(k.first, k.second, row);
     }
 
-    // Restore variables (local domain only; current g./s. survive) and the
-    // execution position.
-    interpreter_->variables().reset_local_temp();
+    // 变量：只替换 local 域；g./s. 是当前会话的系统状态，t. 是框架在
+    // `[load]` 之前刚设好的 scratch（t.autoskip_mute / t.se_load …），
+    // 都不能被存档覆盖。旧档里混进来的 t.* 在读侧已经过滤。
+    interpreter_->variables().local.clear();
     for (const auto& [k, v] : data.local_variables) {
         interpreter_->set_variable(k, v);
     }
+    // `s.current_message_layer` 属于 system 域（不进存档），但它是框架
+    // **本轮 load 收尾的分支依据**：onLoad 的 chgmsg/sysbtn、backlogjump_skipstart
+    // 的 `$s.current_message_layer == 'adv'` 决定重画哪一套窗口。用存档里
+    // 消息层的 active 标记先把它归位，再让 tag 队列跑 —— 否则队列先跑、
+    // 变量后补，框架会认为当前是别的窗口，整段重画被跳过（回顾跳转后
+    // 消息窗框/名字栏消失，只剩一行字）。
+    const bool imel_pages = interpreter_->get_script("system/msg.iet") != nullptr;
+    if (imel_pages)
+        for (const auto& ts : data.text_layers) {
+            if (!ts.active || ts.id.empty()) continue;
+            interpreter_->set_variable("s.current_message_layer",
+                                       oa::runtime::Value::make_string(ts.id));
+            break;
+        }
+    // 页面级消息窗 id（页面变量；旧档没有就保留现场值）。框架的 sysbtn
+    // 目录/窗口重画在 onLoad 的 tag 队列里就要用到它。
+    if (imel_pages && !data.page_meswindow.empty())
+        interpreter_->set_variable("meswindow.num",
+                                   oa::runtime::Value::make_string(data.page_meswindow));
+    // `mwcheck` 是框架"这一页有没有消息窗"的页面标记（menu leave 用它决定
+    // 重建 sysbtn 还是隐藏）。它写在菜单/宏的局部作用域里，平铺变量域在
+    // `[save]` 时看不到；读档时按存档里的消息层内容恢复：有可见的正文页
+    // ⇒ 这一页的窗口是显示的。
     std::vector<oa::runtime::CallFrame> stack;
     for (const auto& [script, line] : data.call_stack) {
         oa::runtime::CallFrame f;
@@ -870,10 +1201,27 @@ LoadResult GameRuntime::RuntimeState::load_game(const std::string& file, int64_t
         f.return_line = line;
         stack.push_back(std::move(f));
     }
+    // 官方 BOWS 的 frame.current：存档发生在框架脚本里时，剧情帧的
+    // return_line 指向"这一页之后"；回到帧的 call_line（宏调用行）才会
+    // 把这一页重走一遍并停在 [@]。
+    if (data.story_call_line > 0) {
+        for (size_t i = stack.size(); i-- > 0;) {
+            if (!stack[i].script.empty() && !oa::runtime::is_framework_script(stack[i].script)) {
+                std::fprintf(stderr,
+                             "[runtime] load: story frame %s return_line %zu -> %zu (call_line)\n",
+                             stack[i].script.c_str(), stack[i].return_line,
+                             data.story_call_line);
+                // 帧对外报的位置 = frame.current（call_line）；重放点也用
+                // call_line，返回点则保持真实值 —— 两者不能混。
+                stack[i].call_line = data.story_call_line;
+                stack[i].return_line = data.story_call_line;
+                break;
+            }
+        }
+    }
     try {
         interpreter_->restore_position(data.current_script, data.current_line, stack);
-    } catch (const std::exception& e) {
-        // 预检已保证脚本可载入 ⇒ 这里只在引擎内部不一致（如内存故障）时到达。
+    } catch (const std::exception& e) {        // 预检已保证脚本可载入 ⇒ 这里只在引擎内部不一致（如内存故障）时到达。
         // 不静默：明确报错 + 返回可判定的失败码（此时状态 = 已清场并已按快照
         // 恢复，没有第二个可回滚的现场，文档里逐字写明）。
         std::fprintf(stderr,
@@ -881,6 +1229,12 @@ LoadResult GameRuntime::RuntimeState::load_game(const std::string& file, int64_t
                      "(%s); scene is the restored snapshot but the position is unset\n",
                      e.what());
         return LoadResult::PositionUnavailable;
+    }
+    static const bool loaddbg = std::getenv("OA_LOADDBG") != nullptr;
+    if (loaddbg) {
+        std::fprintf(stderr, "[loaddbg] after restore_position: %s:%zu queued=%zu\n",
+                     interpreter_->current_script() ? interpreter_->current_script()->c_str() : "",
+                     interpreter_->current_line(), interpreter_->queued_tag_count());
     }
 
     // onLoad (restore): unpack restored variables back into the Lua tables.
@@ -899,18 +1253,27 @@ LoadResult GameRuntime::RuntimeState::load_game(const std::string& file, int64_t
     } catch (const std::exception&) {
         // 没有 scr 的框架（iMel）本来就没事。
     }
+    // 框架注册的 onLoad（iMel setOnLoad / FPM·t13 restore）。名字由
+    // e:setEventHandler 声明，引擎不硬编码 `restore`。
     {
-        const std::map<std::string, std::string> onload_params{{"file", file}};
-        // research/130: same policy as onSave above.
-        try {
-            (void)interpreter_->lua_bridge().call_function("restore", onload_params);
-        } catch (const oa::runtime::LuaError& e) {
-            interpreter_->lua_bridge().report_dispatch_error("calllua", "restore", e.what());
-        }
+        const bool fired = interpreter_->fire_event("onLoad", {{"file", file}});
+        if (std::getenv("OA_LOADDBG"))
+            std::fprintf(stderr, "[loaddbg] onLoad handler fired=%d\n", int(fired));
     }
     // tag 队列不清（② 特判保留）——这里排空的是"读档链自己排的" tag，
     // 顺序契约 2：Lua onLoad → 队列排空 → 引擎音频快照。有界排空可观测。
     (void)drain_tag_queue_bounded("load");
+    if (std::getenv("OA_LOADDBG")) {
+        try {
+            interpreter_->lua_bridge().run_code(
+                "if type(scr) ~= 'table' then error('scr is '..type(scr)) end\n"
+                "if type(scr.adv) ~= 'table' then error('scr.adv is '..type(scr.adv)) end\n",
+                "oa_dbg_scr");
+            std::fprintf(stderr, "[loaddbg] scr.adv ok\n");
+        } catch (const std::exception& e) {
+            std::fprintf(stderr, "[loaddbg] %s\n", e.what());
+        }
+    }
     // Reload sys/gscr/conf Lua tables from the (restored) g.* stash vars.
     try {
         interpreter_->lua_bridge().run_code(
@@ -931,7 +1294,48 @@ LoadResult GameRuntime::RuntimeState::load_game(const std::string& file, int64_t
     // the cursor on it but the message window was empty). Apply the snapshot
     // after the handler and its queued tags have run: the page the reader saw
     // is the one that has to come back.
+    // 场景也一起延后安装（onLoad 会重建消息窗/ dock），先装场景再装文本。
+    if (mel_pages) {
+        // iMel：onLoad 会重建消息窗/dock，场景快照要再盖一次（只盖属性，
+        // handler 用 onLoad 新注册的）。
+        rst = restore_scene_snapshot(&scene(), data, /*clear_scene=*/false,
+                                     /*restore_handlers=*/false);
+        for (const auto& [k, row] : live_input) {
+            scene().restore_input_row(k.first, k.second, row);
+        }
+        renderer_.request_repaint();
+    }
+    // ASB/Lua 框架：保持旧顺序（场景只在 onLoad 前装一次），它们的 bar/按钮
+    // handler 依赖 onLoad 自己的注册时机。
+    // 文本面 = 存档格式里的消息层数据（BOWS 24/25）：框架的 `scenario_reprint`
+    // 读 `get_message_tags`，引擎只交还数据，不贴任何排版结果。
     restore_text_snapshot(&text(), &scene(), data);
+    // `s.current_message_layer` 是 system 域（槽位存档不存 system），但它是
+    // **页状态**：读档前它停在 ly dialog 的 `1000.50`（槽位确认框），不修正
+    // 的话框架之后所有 `$s.current_message_layer == 'adv'` 分支都走错——
+    // 消息窗/名字栏不再重画，菜单里的 msg 也打到对话框层上。
+    if (const std::string restored_active = text().active_layer_id(); !restored_active.empty()) {
+        interpreter_->set_variable("s.current_message_layer",
+                                   oa::runtime::Value::make_string(restored_active));
+    }
+    if (data.page_anchor && interpreter_->get_script("system/msg.iet") != nullptr &&
+        interpreter_->get_script("system/sysbtn.iet") != nullptr) {
+        // 框架的 load 收尾：位置已回到这一页的起点，但存档页/对话框打开时
+        // 折掉的窗口状态（dock、消息窗框/名字栏）要按恢复后的变量重画。
+        // 这些都是**框架脚本自己的重建入口**，引擎只把它们排进队列，
+        // 不往场景里塞任何层。
+        auto enqueue = [&](std::string tag, std::map<std::string, std::string> p = {}) {
+            interpreter_->enqueue_tag(std::move(tag), std::move(p));
+        };
+        for (const char* n : {"t.sysbtn_submenu", "sysbtn_mode", "sysbtn_exist"})
+            enqueue("var", {{"name", n}, {"system", "delete"}});
+        for (const char* id : {"loadmask", "980", "90"})
+            enqueue("lydel", {{"id", id}});
+        enqueue("call", {{"file", "system/msg.iet"}, {"label", "adv_mwredraw"}});
+        enqueue("call", {{"file", "system/msg.iet"}, {"label", "adv_namebar_redraw"}});
+        enqueue("call", {{"file", "system/sysbtn.iet"}, {"label", "sysbtn_init"}});
+        enqueue("call", {{"file", "system/sysbtn.iet"}, {"label", "sysbtn_set"}});
+    }
     renderer_.request_repaint();
 
     if (data.has_audio) restore_audio_snapshot(&media_.audio_, data.audio);
@@ -1001,7 +1405,7 @@ void GameRuntime::RuntimeState::handle_save_tag(const oa::runtime::Event& e) {
         if (file.empty()) {
             (void)syssave(); // no-file [save] == syssave
         } else {
-            (void)save_game_to(file);
+            (void)save_game_to(file, e.save_origin.get());
         }
         return;
     }
@@ -1218,6 +1622,9 @@ void GameRuntime::RuntimeState::maybe_autosave_for_wait() {
         save_.autosave_last_seq_ = seq;
         save_.autosaved_current_wait_ = false;
     }
+    // `[autosave allow]` 的既有语义：只有 2 = 引擎自动存档。iMel 的每页
+    // allow=1 是"允许框架自己的 *オートセーブ 在场景点落盘"，不是让引擎
+    // 在每个内部停驻都写一份（那会把 macro.iet 的每次 [stop] 都存成档）。
     if (save_.autosave_allow_ == 2 && is_input_wait(park_.wait ? &*park_.wait : nullptr) &&
         !save_.autosaved_current_wait_ && save_.save_store_ && save_.save_store_->persistent()) {
         save_.autosaved_current_wait_ = true;
@@ -1245,11 +1652,16 @@ constexpr const char* kLocalVars = "local_variables";
 constexpr const char* kCurrentScript = "current_script";
 constexpr const char* kCurrentLine = "current_line";
 constexpr const char* kCallStack = "call_stack";
+constexpr const char* kStoryCallLine = "story_call_line";
+constexpr const char* kPageReplay = "page_replay";
 constexpr const char* kScript = "script";
 constexpr const char* kReturnLine = "return_line";
+constexpr const char* kLine = "line";
 constexpr const char* kScene = "scene";
 constexpr const char* kRootProps = "root_props";
 constexpr const char* kLayers = "layers";
+constexpr const char* kPageAnchor = "page_anchor";
+constexpr const char* kPageMeswindow = "page_meswindow";
 constexpr const char* kId = "id";
 constexpr const char* kProps = "props";
 constexpr const char* kHandlers = "handlers";
@@ -1272,10 +1684,19 @@ constexpr const char* kPan = "pan";
 constexpr const char* kSkippable = "skippable";
 constexpr const char* kText = "text";
 constexpr const char* kTextLayers = "text_layers";
+constexpr const char* kBacklog = "backlog";
+constexpr const char* kBacklogWrite = "backlog_write";
+constexpr const char* kBacklogAllow = "backlog_allow";
+constexpr const char* kBacklogPages = "pages";
+constexpr const char* kPageFont = "page_font";
+constexpr const char* kTags = "tags";
+constexpr const char* kKind = "kind";
 constexpr const char* kActive = "active";
 constexpr const char* kPositioned = "positioned";
+constexpr const char* kLayered = "layered";
 constexpr const char* kFont = "font";
 constexpr const char* kBox = "box";
+constexpr const char* kVisual = "visual";
 constexpr const char* kRevealed = "revealed";
 
 /// Version gate: newer → FormatError; older → defaults (no migration).
@@ -1508,7 +1929,7 @@ LayerEventHandlerSnap read_handler(Reader& r) {
 }
 
 void write_text_layer(Writer& w, const TextLayerSnap& ts) {
-    w.map_begin(7);
+    w.map_begin(ts.layered >= 0 ? 8 : 7);
     w.str(kId);
     w.str(ts.id);
     w.str(kActive);
@@ -1517,6 +1938,10 @@ void write_text_layer(Writer& w, const TextLayerSnap& ts) {
     w.boolean(ts.positioned);
     w.str(kRevealed);
     w.boolean(ts.revealed);
+    if (ts.layered >= 0) {
+        w.str(kLayered);
+        w.i64(ts.layered);
+    }
     w.str(kBox);
     w.map_begin(4);
     w.str("left");
@@ -1556,6 +1981,8 @@ TextLayerSnap read_text_layer(Reader& r) {
             ts.active = r.boolean();
         } else if (key == kPositioned) {
             ts.positioned = r.boolean();
+        } else if (key == kLayered) {
+            ts.layered = int(r.i64());
         } else if (key == kRevealed) {
             ts.revealed = r.boolean();
         } else if (key == kBox) {
@@ -1577,6 +2004,60 @@ TextLayerSnap read_text_layer(Reader& r) {
         }
     }
     return ts;
+}
+
+LayerSnap read_layer(Reader& r);
+
+void write_backlog_page(Writer& w, const BacklogPageSnap& bp) {
+    // 回顾页只存**重放命令**（print/font/rt…）。画面与脚本锚点属于框架
+    // 自己的载体（backlog_N.dat / log.stack / blj），引擎不复制一份。
+    w.map_begin(2);
+    w.str(kPageFont);
+    write_str_map(w, bp.page_font);
+    w.str(kTags);
+    w.array_begin(bp.tags.size());
+    for (const auto& t : bp.tags) {
+        w.map_begin(4);
+        w.str(kKind);
+        w.i64(t.kind);
+        w.str(kText);
+        w.str(t.text);
+        w.str(kFont);
+        write_str_map(w, t.font);
+        w.str(kParams);
+        write_str_map(w, t.params);
+    }
+}
+
+BacklogPageSnap read_backlog_page(Reader& r) {
+    BacklogPageSnap bp;
+    const size_t n = r.map_entries();
+    for (size_t i = 0; i < n; ++i) {
+        const std::string key = r.str();
+        if (key == kPageFont) {
+            bp.page_font = read_str_map(r);
+        } else if (key == kTags) {
+            const size_t tn = r.array_items();
+            bp.tags.reserve(tn);
+            for (size_t j = 0; j < tn; ++j) {
+                BacklogTagSnap t;
+                const size_t mn = r.map_entries();
+                for (size_t k = 0; k < mn; ++k) {
+                    const std::string tk = r.str();
+                    if (tk == kKind) t.kind = int(r.i64());
+                    else if (tk == kText) t.text = r.str();
+                    else if (tk == kFont) t.font = read_str_map(r);
+                    else if (tk == kParams) t.params = read_str_map(r);
+                    else r.skip_value();
+                }
+                bp.tags.push_back(std::move(t));
+            }
+        } else {
+            // 旧档的 script/line/call_stack/visual：跳过，不迁移。
+            r.skip_value();
+        }
+    }
+    return bp;
 }
 
 LayerSnap read_layer(Reader& r) {
@@ -1607,7 +2088,9 @@ std::string SaveData::encode() const {
         throw FormatError("save position out of int64 range");
     }
     Writer w;
-    w.map_begin(4 + (has_scene ? 1 : 0) + (has_audio ? 1 : 0) + (has_text ? 1 : 0));
+    w.map_begin(4 + (has_scene ? 1 : 0) + (has_audio ? 1 : 0) + (has_text ? 1 : 0) +
+                (has_backlog ? 1 : 0) + (story_call_line ? 1 : 0) + (page_replay ? 1 : 0) +
+                (page_anchor ? 1 : 0) + (page_meswindow.empty() ? 0 : 1));
     w.str(kLocalVars);
     w.map_begin(local_variables.size());
     for (const auto& [k, v] : local_variables) {
@@ -1630,9 +2113,24 @@ std::string SaveData::encode() const {
         w.str(kReturnLine);
         w.i64(int64_t(line));
     }
+    if (story_call_line) {
+        w.str(kStoryCallLine);
+        w.i64(int64_t(story_call_line));
+    }
+    if (page_replay) {
+        w.str(kPageReplay);
+        w.boolean(true);
+    }
+    if (page_anchor) {
+        w.str(kPageAnchor);
+        w.boolean(true);
+    }
+    if (!page_meswindow.empty()) {
+        w.str(kPageMeswindow);
+        w.str(page_meswindow);
+    }
     if (has_scene) {
-        w.str(kScene);
-        w.map_begin(2);
+        w.str(kScene);        w.map_begin(2);
         w.str(kRootProps);
         write_str_map(w, root_props);
         w.str(kLayers);
@@ -1649,6 +2147,17 @@ std::string SaveData::encode() const {
         w.str(kTextLayers);
         w.array_begin(text_layers.size());
         for (const auto& ts : text_layers) write_text_layer(w, ts);
+    }
+    if (has_backlog) {
+        w.str(kBacklog);
+        w.map_begin(3);
+        w.str(kBacklogWrite);
+        w.boolean(backlog_write_mode);
+        w.str(kBacklogAllow);
+        w.boolean(backlog_allow);
+        w.str(kBacklogPages);
+        w.array_begin(backlog.size());
+        for (const auto& bp : backlog) write_backlog_page(w, bp);
     }
     return w.data();
 }
@@ -1897,7 +2406,12 @@ SaveData SaveData::decode(const std::string& bytes) {
             const size_t vn = r.map_entries();
             for (size_t j = 0; j < vn; ++j) {
                 const std::string name = r.str();
-                d.local_variables[name] = read_value(r);
+                Value v = read_value(r);
+                // 旧版本把 t.* 一起存进了槽位变量表。t.* 是 scratch，
+                // **绝不能**在读档时回灌：t10 的 t.saveslot 一旦非 0，
+                // save.iet 会走"保存成功"分支，读档就变成存档收尾。
+                if (name.rfind("t.", 0) == 0) continue;
+                d.local_variables[name] = std::move(v);
             }
         } else if (key == kCurrentScript) {
             d.current_script = r.str();
@@ -1925,6 +2439,14 @@ SaveData SaveData::decode(const std::string& bytes) {
                 if (line < 0) throw FormatError("negative return_line in save");
                 d.call_stack.emplace_back(std::move(script), size_t(line));
             }
+        } else if (key == kStoryCallLine) {
+            d.story_call_line = size_t(r.i64());
+        } else if (key == kPageReplay) {
+            d.page_replay = r.boolean();
+        } else if (key == kPageAnchor) {
+            d.page_anchor = r.boolean();
+        } else if (key == kPageMeswindow) {
+            d.page_meswindow = r.str();
         } else if (key == kScene) {
             d.has_scene = true;
             const size_t sn = r.map_entries();
@@ -1955,6 +2477,23 @@ SaveData SaveData::decode(const std::string& bytes) {
                 const size_t ln = r.array_items();
                 d.text_layers.reserve(ln);
                 for (size_t k = 0; k < ln; ++k) d.text_layers.push_back(read_text_layer(r));
+            }
+        } else if (key == kBacklog) {
+            d.has_backlog = true;
+            const size_t bn = r.map_entries();
+            for (size_t j = 0; j < bn; ++j) {
+                const std::string bkey = r.str();
+                if (bkey == kBacklogWrite) {
+                    d.backlog_write_mode = r.boolean();
+                } else if (bkey == kBacklogAllow) {
+                    d.backlog_allow = r.boolean();
+                } else if (bkey == kBacklogPages) {
+                    const size_t pn = r.array_items();
+                    d.backlog.reserve(pn);
+                    for (size_t k = 0; k < pn; ++k) d.backlog.push_back(read_backlog_page(r));
+                } else {
+                    r.skip_value();
+                }
             }
         } else {
             r.skip_value();

@@ -480,6 +480,28 @@ public:
     std::string hit_test(double mx, double my, const QuadSizeFn& size,
         void* userdata, const AlphaSamplerFn& alpha = {}) const;
 
+    /// 指针位置上的事件归属。一次命中扫描，三个消费者共用同一份答案。
+    ///
+    ///   owner    —— 最前面的**可交互层**（任意启用的处理行）。按下的拖拽
+    ///               只认它：更下面的 drag 层不能抢走上层按钮的点击。
+    ///               旧框架的列表页就是"按钮在上、全屏拖拽层在下"
+    ///               （backlog 的 jump 按钮盖在 500.0.drag 上）。
+    ///   click    —— 点击派发链（下 → 上）：最前面的 click 层，加上它下面
+    ///               声明了 penetration 的 click 层。
+    ///   rollover —— hover 链（下 → 上），同一套"顶层 + penetration"。
+    ///
+    /// "顶层"取**带该事件处理行的第一层**，不是命中列表的第一层：没有这个
+    /// 处理行的层本来就不参与该事件，不该占名额（test13 的槽位上盖着一层
+    /// alpha=0 的拖拽缩略图，按命中列表取第一层会把槽位按钮全挡掉）。
+    struct PointerProbe {
+        std::string owner;
+        std::vector<std::string> hits;      // 命中列表（前 → 后，含不可交互的装饰层）
+        std::vector<std::string> click;
+        std::vector<std::string> rollover;
+    };
+    PointerProbe probe_pointer(double mx, double my, const QuadSizeFn& size,
+                               void* userdata, const AlphaSamplerFn& alpha = {}) const;
+
     // ------------------------------------------------------------------
     // event registries + draggable/dragarea
     // ------------------------------------------------------------------

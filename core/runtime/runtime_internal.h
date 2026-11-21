@@ -45,6 +45,7 @@ struct GameRuntime::RuntimeState {
         uint64_t voice_serial_ = 0;
         std::optional<float> last_bgm_volume_;
         std::optional<float> last_se_volume_;
+        std::optional<float> last_voice_volume_;
         size_t media_events_ = 0;
         size_t media_handler_dispatches_ = 0;
     };
@@ -96,6 +97,8 @@ struct GameRuntime::RuntimeState {
         bool skip_enabled_ = false;
         bool automode_ = false;
         bool automode_allowed_ = true;
+        /// [automode stopbyclick=1] —— 玩家点一下屏幕就退出自动模式。
+        bool automode_stopbyclick_ = true;
         std::string automode_syncse_;
         bool control_skip_pressed_ = false;
         bool control_skip_blocked_ = false;
@@ -104,6 +107,11 @@ struct GameRuntime::RuntimeState {
         std::string rclick_file_;
         bool hide_allowed_ = false;
         bool hide_active_ = false;
+        /// 緊急回避／スクランブル：[avoid file=...] 记住的覆盖图（全屏，
+        /// 压在所有层之上），keyconfig role 15 进入、role 16 退出。
+        std::string avoid_file_;
+        bool avoid_windowbutton_ = true;
+        bool avoid_active_ = false;
         std::vector<std::string> hide_window_;
         std::map<std::string, bool> hide_snapshot_;
         std::map<int, std::set<int>> keymap_;
@@ -218,7 +226,8 @@ struct GameRuntime::RuntimeState {
     bool skip_active() const {
         return control_.skip_allowed_ && (control_.skip_enabled_ || control_skip_effective());
     }
-    bool automode_active() const { return control_.automode_allowed_ && control_.automode_; }
+    bool automode_active() const { return control_.automode_; }
+    bool avoid_active() const { return control_.avoid_active_; }
     bool hide_active() const { return control_.hide_active_; }
     bool control_skip_effective() const {
         return control_.control_skip_pressed_ && !control_.control_skip_blocked_ && control_.skip_allowed_;
@@ -275,7 +284,11 @@ struct GameRuntime::RuntimeState {
     }
     void sysload();
     bool syssave();
-    bool save_game_to(const std::string& file);
+    /// 写一份存档点（= 官方 BOWS：脚本栈 + local 变量 + 画面层 + 文本面 +
+    /// 音频 + 回顾表）。`origin` 非空时用 `[save]` 事件带来的执行现场；
+    /// 空 = 宿主自动存档，用当前停驻。
+    bool save_game_to(const std::string& file,
+                      const oa::runtime::SaveOrigin* origin = nullptr);
     LoadResult load_game(const std::string& file, int64_t trans_type);
     bool load_game_from(const std::string& file, int64_t trans_type);
     bool save_file_exists(const std::string& file) const;
@@ -375,8 +388,14 @@ struct GameRuntime::RuntimeState {
     void dispatch_media_handler(const oa::media::VideoFinishHandler& h);
     void sync_system_audio_volumes();
     void set_bgm_loop_file(const std::string& file, bool loop_play);
-    /// get_sound_info 的数据面：BGM + SE 总线（按 id 排序）。形状归宿主，
-    /// 解释器只负责把它写成 `name.playing/.gain/.pan` 这些变量。
+    /// 通道的实值音量：框架（preset.iet / config.iet）为每个声道算好
+    /// `s.segain.<通道id>`（SE=800、VOICE=g.segain.<id> × g.voicegain ×
+    /// (1-角色静音)）。通道开声时取它——引擎只认标签上的 gain= 的话，
+    /// VOICE 滑杆 / 逐角色音量 / 逐角色静音在播放阶段全部失效。
+    std::optional<int32_t> realized_channel_gain(const std::string& id) const;
+    /// get_sound_info 的数据面：BGM + SE 通道（按 id 排序；原生 [voice]
+    /// 通道也在这里——脚本用 get_sound_info/se_sound_info 判断"谁还在播"，
+    /// 漏掉 voice_channels 会让 prevoice_out/voice_stop 以为没人在播）。
     struct SoundSnap {
         struct Ch {
             std::string id;
@@ -388,6 +407,8 @@ struct GameRuntime::RuntimeState {
         std::vector<Ch> se;
     };
     SoundSnap sound_info_snapshot() const;
+    /// 只读：所有通道 + 解码进度（GameRuntime::sound_state 的实现面）。
+    std::vector<GameRuntime::SoundChannelState> sound_state() const;
     /// 文本度量（宿主注入：字体替换时按测量结果等比缩放）。
     std::function<std::tuple<double, double, double>()> text_metrics;
     /// Apply a scene event; true = consumed (never reaches the host stream).
@@ -416,19 +437,35 @@ struct GameRuntime::RuntimeState {
     void run_until_wait();
     /// Drain queued tags while parked; may replace or clear `park_.wait`.
     void drain_parked_queue();
-    /// Hit test → hover diff → click/drag/push; reports claimed edges.
-    struct PointerConsumption {
-        bool layer_handled = false;   // a click-handler row dispatched
-        bool drag_handled = false;    // a drag chain ran on this edge
-        bool left_push_handled = false; // global push key 1 dispatch handled
-        bool role_advance = false;    // a keyconfig role-0 key was pressed
-        bool input_swallowed = false; // hide-mode click recovery consumed it
+    /// 一次按下的最终归属。**唯一**的仲裁结果：层、停驻、推图都只读它。
+    ///
+    /// 一次物理按下（左键 / Enter / Space）是一张只能被认领一次的票。
+    /// 认领顺序固定：引擎门（回避/hide/overrideKey）→ 层（click/drag）→
+    /// 脚本停驻。没有认领的按下才轮到脚本翻页。role-0 键由
+    /// dispatch_key_edges 单独报告（它不占这张票，只在无人认领时放行脚本）。
+    struct PressDecision {
+        enum class Owner {
+            None,   // 这一帧没有输入
+            Engine, // 引擎吃掉（hide 恢复 / 紧急回避 / overrideKey）
+            Layer,  // 某个层接住了（按钮 click / 拖拽）
+            Script, // 没有层要它：交给脚本停驻（翻页 / 决定）
+        };
+        Owner owner = Owner::None;
+        std::string layer;      // Owner::Layer 时的目标层
+        bool press = false;     // 本帧有新的物理按下（左键 / Enter / Space）
     };
-    PointerConsumption process_pointer_input(const oa::runtime::FrameInput& in);
-    /// Run one registered row through filter + calllua; true = handled.
+    PressDecision process_pointer_input(const oa::runtime::FrameInput& in);
+    /// Run one registered row through filter + calllua.
     /// row 按值传：下面的 Lua 回调可以重新注册/删除 handler，寄存器里的
     /// 那一行随时会失效（fuzz 抓到的 heap-use-after-free）。
-    bool dispatch_layer_row(const std::string& id, oa::render::LayerEventHandler row,
+    ///
+    /// NotHandled = 这一行没执行；Handled = 执行了；Masked = 脚本的
+    /// `e:setEventFilter` 否决了这一行（框架的输入掩码）。
+    /// **Masked 也算"这一下被层接住"**：掩码的含义是"别执行按钮动作"，
+    /// 不是"把玩家这一下让给脚本翻页"。把它当未处理会让掩码期间的点击
+    /// 同时触发剧情，正是"按钮点一次既不开菜单又翻一页"的来源。
+    enum class HandlerOutcome { NotHandled, Handled, Masked };
+    HandlerOutcome dispatch_layer_row(const std::string& id, oa::render::LayerEventHandler row,
                             const std::string& event_type,
                             const std::vector<std::pair<std::string, std::string>>& runtime_params,
                             PointerDispatch::Kind kind);
@@ -528,6 +565,13 @@ struct GameRuntime::RuntimeState {
     bool has_role(int role, int key) const;
     bool advance_keys_set() const; // the game named its role-0 keys
     bool handle_role_key_edge(int key);
+    /// 键位边沿（role 键 + setonpush）。只报告"认领了什么"，不碰 PressDecision：
+    /// 键位侧不是按下的所有者，它只在没有层/引擎认领时才影响脚本。
+    struct KeyEdgeClaims {
+        bool role_page = false;  // 有 role-0 键边沿 = 玩家的"下一页/决定"
+        bool left_push = false;  // setonpush 行接了鼠标左键
+    };
+    KeyEdgeClaims dispatch_key_edges();
     void apply_keyconfig(const std::map<std::string, std::string>& params);
     void apply_rclick_config(const std::map<std::string, std::string>& params);
     void apply_hide_config(const std::map<std::string, std::string>& params);
@@ -535,6 +579,15 @@ struct GameRuntime::RuntimeState {
     void apply_automode_config(const std::map<std::string, std::string>& params);
     void apply_exec_command(const std::map<std::string, std::string>& params);
     void apply_mouse_config(const std::map<std::string, std::string>& params);
+    /// 控制域的瞬态状态 → `s.status.*`（框架的 get_skip()/avoid 判定读它们）。
+    void sync_control_status();
+    /// 已读行（既読）状态：从 g.readlines 解出 / 写回（sysload/syssave 的
+    /// 一部分；skip 的既读判定靠它）。
+    void load_read_state();
+    void save_read_state();
+    /// 緊急回避の開始／終了（[avoid] の画像を最前面に出す／消す）。
+    void start_avoid();
+    void end_avoid();
     bool trigger_rclick();
     void toggle_hide_mode();
     void exit_hide_mode();

@@ -200,6 +200,20 @@ public:
     const oa::media::AudioEngine& audio() const;
     const oa::media::VideoEngine& video() const;
     oa::media::MediaPlayers& media_players();
+    /// 一路正在播（或刚停）的通道的可观测状态。`category` = "bgm"/"se"/"voice"，
+    /// `gain` 是最终乘数（通道增益 × 类别总线 × 主音量），`decoded_seconds` 是
+    /// 解码器已产出的源时长——无头宿主没有音频设备时，它就是"文件打开、解码
+    /// 成功"的等价证据。只读，供诊断与回归断言。
+    struct SoundChannelState {
+        std::string category;
+        std::string id;
+        std::string file;
+        bool playing = false;
+        float gain = 0.0f;
+        double decoded_seconds = 0.0;
+        bool decodable = true;
+    };
+    std::vector<SoundChannelState> sound_state() const;
     /// Override the media asset loader (defaults to the project filesystem +
     /// magic-path resolution). Tests inject synthetic assets here.
     void set_media_loader(
@@ -230,6 +244,8 @@ public:
     bool syssave();
     /// Numbered save (host/tests may call directly).
     bool save_game_to(const std::string& file);
+    /// Whether a numbered save exists under the current save root.
+    bool save_file_exists(const std::string& file) const;
     /// Load a numbered save; authoritative entry, failures are atomic.
     LoadResult load_game(const std::string& file, int64_t trans_type);
     /// `load_game(...) == LoadResult::Ok`.

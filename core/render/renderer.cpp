@@ -94,6 +94,8 @@ bool RenderEngine::create_renderer(void* native_window,
             stage_h_ = h;
         }
     }
+    // 折行的最后兜底：消息层无字体表宽度时按舞台宽收口。
+    if (text_ptr_) text_ptr_->set_stage_width(double(stage_w_));
     // 后端接入点（唯一）：--renderer / OA_RENDERER 选线；缺省 = sdl（与
     // HEAD 行为逐位一致）。gles 不可用（无 GLES 上下文等）→ create false +
     // last_error，宿主报错退出——不静默降级。
@@ -308,12 +310,7 @@ void RenderEngine::build_plan(const oa::render::Compositor& sc,
     // 层容器版本号决定。
     const uint64_t scene_rev = sc.revision();
     const uint64_t text_rev = text_ptr_ ? text_ptr_->revision() : 0;
-    // OA_PLAN_REUSE=0：关掉计划复用（每帧重建），用于定位"复用门漏信号"类问题。
-    static const bool reuse_enabled = [] {
-        const char* v = std::getenv("OA_PLAN_REUSE");
-        return !(v && *v == '0');
-    }();
-    if (reuse_enabled && plan_valid_ && plan_scene_ == &sc &&
+    if (plan_valid_ && plan_scene_ == &sc &&
         scene_rev == plan_scene_rev_ &&
         text_rev == plan_text_rev_ && global_fade == plan_fade_ &&
         stage_w_ == plan_stage_w_ && stage_h_ == plan_stage_h_) {

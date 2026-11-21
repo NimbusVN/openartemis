@@ -10,6 +10,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <set>
 #include <stdexcept>
 #include <utility>
 #include <vector>
@@ -316,7 +317,8 @@ std::vector<Token> tokenize(std::string_view input) {
             }
             default: break;
         }
-        if (std::isdigit(uint8_t(c)) || c == '.') {
+        if (std::isdigit(uint8_t(c)) ||
+            (c == '.' && i + 1 < n && std::isdigit(uint8_t(input[i + 1])))) {
             // Hex: only "0x" form consumes hex digits.
             if (c == '0' && i + 1 < n && (input[i + 1] == 'x' || input[i + 1] == 'X')) {
                 size_t b = i;
@@ -1122,8 +1124,20 @@ Script Script::parse(const std::string& name, std::string_view content) {
     // script itself registers one, so every other title parses unchanged.
     PreprocRules pre;
     size_t current_line_num = 0;
+    // A "scenario text line" is one that carries narrative text somewhere on
+    // it. Tag-only command rows ([背景]/[イベントCG]/[printlang]…) are NOT
+    // text lines: the original preprocessor does not decorate them with
+    // [onlinehead]/[onlineend] (macro bodies call [onlinehead_check] when they
+    // need it). Multi-line tag rows are tag rows too.
+    auto has_scenario_text = [](const std::string& s) {
+        if (has_unclosed_tag(s)) return false;
+        for (const Segment& seg : split_line_segments(s)) {
+            if (!seg.is_tag && !trim(seg.text).empty()) return true;
+        }
+        return false;
+    };
     // Append the line's tail decorators: [&scpsupport] char rules first, then
-    // the unconditional [&autoinsert target="lineend"] payload.
+    // [&autoinsert target="lineend"] payload (text lines only).
     auto decorate_tail = [&](const std::string& source_line) {
         if (pre.chars.empty() && pre.lineend.empty()) return;
         // Where the rules fire: a `char` rule matches the trailing scenario
@@ -1143,7 +1157,7 @@ Script Script::parse(const std::string& name, std::string_view content) {
                                                        rule.ch.size(), rule.ch) == 0);
             if (fire) append_preproc_commands(out, rule.command, current_line_num);
         }
-        if (!pre.lineend.empty())
+        if (!pre.lineend.empty() && has_scenario_text(source_line))
             append_preproc_commands(out, pre.lineend, current_line_num);
     };
 
@@ -1195,7 +1209,14 @@ Script Script::parse(const std::string& name, std::string_view content) {
             ++line_idx;
             continue;
         }
-        if (!pre.linehead.empty())
+        // [&autoinsert target="linehead"] 是**剧情行的行头装饰**，不是每行都有。
+        // 原版 preprocessor 只把 [onlinehead] 插在有叙事文字的行前；以标签开头
+        // 的命令行（[背景]/[イベントCG]/[printlang]…）靠宏内部的
+        // [onlinehead_check] 自己补。以前这里对每一行都插，于是紧跟标签行的
+        // 空行会看到 onlinehead=1 / onlineend=0，onblankline 先补 onlineend
+        // （顺手把 scpstat 置回 normal），再据此多插一次 `[@]` 页停——表现就是
+        // 换 CG 后消息窗已隐藏，还要再点一下才推进（test10 开头）。
+        if (!pre.linehead.empty() && has_scenario_text(line))
             append_preproc_commands(out, pre.linehead, line_num);
 
         // [&linetag] command row: "<prefix>tag p0,p1,...". The command name
@@ -1523,6 +1544,39 @@ const Script* Interpreter::get_script(const std::string& name) const {
     return it == scripts_.end() ? nullptr : &it->second;
 }
 
+void Interpreter::note_text_position() {
+    if (!current_script_name_) return;
+    const bool already = note_text_line(*current_script_name_, current_line_);
+    variables_.set("s.status.alreadyread", Value::make_int(already ? 1 : 0));
+}
+
+bool Interpreter::note_text_line(const std::string& script, size_t line) {
+    if (script.empty() || line > 0xFFFFFFFFull) return false;
+    auto& lines = read_lines_[script];
+    const auto key = static_cast<uint32_t>(line);
+    const bool already = lines.count(key) > 0;
+    lines.insert(key);
+    return already;
+}
+
+bool Interpreter::has_read_line(const std::string& script, size_t line) const {
+    const auto it = read_lines_.find(script);
+    return it != read_lines_.end() && it->second.count(static_cast<uint32_t>(line)) > 0;
+}
+
+void Interpreter::set_read_lines(std::map<std::string, std::set<uint32_t>> lines) {
+    read_lines_ = std::move(lines);
+}
+
+void Interpreter::merge_read_lines(
+    const std::map<std::string, std::vector<uint32_t>>& lines) {
+    for (const auto& [script, rows] : lines) {
+        if (script.empty()) continue;
+        auto& dst = read_lines_[script];
+        dst.insert(rows.begin(), rows.end());
+    }
+}
+
 void Interpreter::load_script(const std::string& name, std::string_view text) {
     Script script = Script::parse(name, text);
     // [lua] blocks execute once at load, in order (Artemis semantics).
@@ -1653,9 +1707,52 @@ void Interpreter::restore_position(const std::string& script, size_t line,
     stable_script_ = script;
     stable_line_ = line;
     queue_stack_.clear(); // 帧被整体替换，旧的每层队列不再有意义
+    page_start_valid_ = false;
     arrived_by_jump_ = false;
     last_wait_from_queue_ = false;
     macro_param_saves_.clear();
+}
+
+bool Interpreter::resolve_label_from(const std::string& context, const std::string& label,
+                                     std::string* file, size_t* line) const {
+    if (label.empty()) return false;
+    const auto try_script = [&](const std::string& name) -> bool {
+        if (name.empty()) return false;
+        const auto it = scripts_.find(name);
+        if (it == scripts_.end()) return false;
+        const auto found = it->second.get_label_line(label);
+        if (!found) return false;
+        if (file) *file = name;
+        if (line) *line = *found;
+        return true;
+    };
+    // [1] 发起这条 tag 的脚本（排队 tag 的 origin / 内联 tag 的当前脚本）。
+    //     同文件内的 label 永远是第一优先。
+    if (try_script(context)) return true;
+    // [3] 框架命名空间：iMel 的 config.iet 与 config_*.iet 是一组**共享标签**
+    //     的页面（config_s.iet 顶部注释「config.iet 必須」），并直接
+    //     `[call label="mw_reprop"]`。这些 label 只存在于 config.iet，属于
+    //     框架自己的跨页命名空间，所以按文件名稳定排序扫一遍框架脚本。
+    //     剧情脚本不参与 —— 剧情缺 label 必须是可见的作者错误。
+    for (const auto& [name, script] : scripts_) {
+        (void)script;
+        if (!oa::runtime::is_framework_script(name)) continue;
+        if (try_script(name)) {
+            static std::set<std::string> logged;
+            if (logged.insert(label + "\x1f" + name).second) {
+                std::fprintf(stderr, "[label] '%s' resolved in the framework namespace: %s\n",
+                             label.c_str(), name.c_str());
+            }
+            return true;
+        }
+    }
+    return false;
+}
+
+bool Interpreter::resolve_label(const std::string& label, std::string* file,
+                                size_t* line) const {
+    return resolve_label_from(current_script_name_ ? *current_script_name_ : std::string(), label,
+                              file, line);
 }
 
 bool Interpreter::begin_handler_frame() {
@@ -1694,6 +1791,7 @@ bool Interpreter::handler_return_now() {
         if (hooks_.frame_popped) (void)hooks_.frame_popped();
         current_script_name_ = frame.script;
         current_line_ = frame.return_line;
+        arrived_by_jump_ = true;
         return true;
     }
     while (call_stack_.size() > idx + 1) {
@@ -1706,6 +1804,7 @@ bool Interpreter::handler_return_now() {
     call_stack_.pop_back();
     current_script_name_ = entry.script;
     current_line_ = entry.return_line;
+    arrived_by_jump_ = true;
     return true;
 }
 
@@ -1722,6 +1821,7 @@ void Interpreter::start(const std::string& script, std::string_view label) {
     current_line_ = *line;
     call_stack_.clear();
     queue_stack_.clear();
+    page_start_valid_ = false;
     arrived_by_jump_ = false;
     stable_script_ = script;
     stable_line_ = *line;
@@ -1782,7 +1882,7 @@ void Interpreter::restore_macro_params(size_t depth) {
     macro_param_saves_.pop_back();
 }
 
-std::optional<std::pair<std::string, std::map<std::string, std::string>>>
+std::optional<oa::runtime::LuaHost::ScriptBlock>
 Interpreter::script_block(const std::string& file, size_t index) const {
     // iMel's tag filters (macro.iet: tagFilters.waitstop / .return) take a
     const Script* script = nullptr;
@@ -1814,7 +1914,11 @@ Interpreter::script_block(const std::string& file, size_t index) const {
     if (index >= rows.size()) {
         index = rows.size() - 1;
     }
-    return std::make_pair(rows[index].tag, rows[index].params);
+    oa::runtime::LuaHost::ScriptBlock out;
+    out.command = rows[index].tag;
+    out.params = rows[index].params;
+    out.line = rows[index].line;
+    return out;
 }
 
 const std::string* Interpreter::current_script() const {
@@ -1838,9 +1942,28 @@ void Interpreter::enqueue_tag(std::string tag, std::map<std::string, std::string
     ins.tag = std::move(tag);
     ins.params = std::move(params);
     ins.line = 0;
+    if (std::getenv("OA_SAVE_TRACE") && ins.tag == "save") {
+        std::fprintf(stderr, "[saveorigin] enqueue save at %s@%zu\n",
+                     current_script_name_ ? current_script_name_->c_str() : "-", current_line_);
+    }
     if (in_handler_frame()) ins.floor_depth = logical_depth();
     if (current_script_name_) ins.origin_script = *current_script_name_;
+    // 过滤器自己重投递的命令按原样执行并原位插回队首；业务侧排下的命令
+    // 保持原来的排队语义（只有带掩码的 trans 例外，见 flush_tag_queue）。
+    ins.skip_filter = lua_bridge_ && lua_bridge_->in_tag_filter();
+    if (ins.skip_filter) {
+        filter_emitted_.push_back(std::move(ins));
+        return;
+    }
     tag_queue_.push_back(std::move(ins));
+}
+
+void Interpreter::splice_filter_emitted() {
+    if (filter_emitted_.empty()) return;
+    tag_queue_.insert(tag_queue_.begin(),
+                      std::make_move_iterator(filter_emitted_.begin()),
+                      std::make_move_iterator(filter_emitted_.end()));
+    filter_emitted_.clear();
 }
 
 ExecutionResult Interpreter::run_queued() {
@@ -1892,11 +2015,90 @@ bool tag_bool(std::string_view v, bool fallback) {
 } // namespace
 
 /// Entry point for one instruction.
-static TagOutcome execute_tag(Interpreter& it, const Instruction& ins, bool apply_filter) {
+static TagOutcome execute_tag(Interpreter& it, const Instruction& ins, bool apply_filter,
+                              bool from_script = false) {
     // [&linetag] row: "command p0,p1,..." — tag.ini names the columns
     // (tag/preprocessor/linetag.txt: "パラメータ名を省略する代わりに、
     // tag.ini ファイルによってパラメータ順序を定義する"). Expand, then run the
     // command through the normal dispatch (it is a macro of macro.iet).
+    if (ins.kind == Instruction::Kind::Tag && ins.tag == "tag" && ins.get("data")) {
+        // [tag data="print,data,こんにちは"] —— "把这一串原样当命令执行"。
+        //
+        // 框架的回顾页把每一条已读行的命令拆成字符串数组存盘，重印时逐条
+        // `e:tag{"tag", data = back_tag}` 发回来。以前 `tag` 只被当成配置类
+        // 指令忽略掉：回顾页的行框、字体、坐标全都建好了，**一个字符都没印**
+        // （玩家报的"backlog 没有字体"）。命令串是 `tag,key,val,…` 的键值对
+        // （backlog.iet 用前两个逗号段判断命令名/`__noreprint`，save.iet 用
+        // explode 成对还原），所以按**键值对**解析，不是 tag.ini 的位置列。
+        const std::string payload = *ins.get("data");
+        if (std::getenv("OA_TAGDBG"))
+            std::fprintf(stderr, "[tagreplay] '%s' at %s:%zu\n", payload.substr(0, 90).c_str(),
+                         it.current_script() ? it.current_script()->c_str() : "", it.current_line());
+        // 两种形态都要接：
+        //   `se_play,id,0,file,...`     —— 逗号键值对
+        //   `[font align="left" ...]`   —— 原样一条完整标签（msg.iet 的字体重放）
+        Instruction replayed;
+        replayed.kind = Instruction::Kind::Tag;
+        replayed.line = ins.line;
+        replayed.floor_depth = ins.floor_depth;
+        replayed.origin_script = ins.origin_script;
+        if (!payload.empty() && payload.front() == '[') {
+            const size_t close = payload.rfind(']');
+            const std::string inner =
+                payload.substr(1, close == std::string::npos ? std::string::npos : close - 1);
+            size_t sp = 0;
+            while (sp < inner.size() && !is_space(inner[sp])) ++sp;
+            replayed.tag = inner.substr(0, sp);
+            if (!replayed.tag.empty())
+                replayed.params = parse_params(trim(std::string_view(inner).substr(sp)), ins.line);
+        } else {
+            size_t sp = 0;
+            while (sp < payload.size() && !is_space(payload[sp]) && payload[sp] != ',') ++sp;
+            replayed.tag = payload.substr(0, sp);
+            size_t rest_at = sp;
+            if (rest_at < payload.size() && payload[rest_at] == ',') ++rest_at;
+            const std::string rest = trim(std::string_view(payload).substr(rest_at));
+            if (!rest.empty()) {
+                // 格式是**键值对**：`print,ja,テキスト` = `[print ja="テキスト"]`。
+                // 框架自己也是两两取（backlog.iet 里 `for m = 1, n, 2 do p[key]=val`），
+                // 不是 tag.ini 的位置列 —— 按位置读会把 `ja` 当第 0 列、正文整段丢掉。
+                //
+                // 逗号是**转义**过的：框架写文本时 `gsub("([^\\]),", "%1\\,")`
+                // （save.iet），所以切分要跳过 `\,`，切完再还原；值不做 trim，
+                // 正文可能就以空格开头/结尾（`[print data=" "]`）。
+                std::vector<std::string> fields;
+                std::string cur;
+                bool esc = false;
+                for (char c : rest) {
+                    if (esc) {
+                        cur += c;
+                        esc = false;
+                    } else if (c == '\\') {
+                        esc = true;
+                    } else if (c == ',') {
+                        fields.push_back(std::move(cur));
+                        cur.clear();
+                    } else {
+                        cur += c;
+                    }
+                }
+                if (esc) cur += '\\';
+                fields.push_back(std::move(cur));
+                // fields[0] 是第一个**键**（tag 名已经被前面吃掉了）。
+                for (size_t i = 0; i + 1 < fields.size(); i += 2) {
+                    std::string key = trim(std::string_view(fields[i]));
+                    std::string& value = fields[i + 1];
+                    if (value.size() >= 2 && value.front() == '"' && value.back() == '"')
+                        value = value.substr(1, value.size() - 2);
+                    if (!key.empty()) replayed.params.emplace(std::move(key), std::move(value));
+                }
+            }
+        }
+        // 只展开一层：payload 本身又是 tag 的话不再递归（防止自引用）。
+        if (replayed.tag.empty() || replayed.tag == "tag") return TagOutcome{};
+        return execute_tag(it, replayed, apply_filter, from_script);
+    }
+
     if (ins.kind == Instruction::Kind::LineTag) {
         const std::string text = ins.get_or("text", "");
         size_t sp = 0;
@@ -1929,7 +2131,7 @@ static TagOutcome execute_tag(Interpreter& it, const Instruction& ins, bool appl
             }
         }
         if (expanded.tag.empty()) return TagOutcome{};
-        return execute_tag(it, expanded, apply_filter);
+        return execute_tag(it, expanded, apply_filter, from_script);
     }
 
     const std::string& tag = ins.tag;
@@ -1981,6 +2183,8 @@ static TagOutcome execute_tag(Interpreter& it, const Instruction& ins, bool appl
                 it.lua_bridge().report_dispatch_error("tag filter", tag, e.what());
                 d = oa::runtime::FilterDecision::Missing;
             }
+            // 过滤器用 e:tag/e:enqueueTag 重投递的真命令原位顶替这一条。
+            it.splice_filter_emitted();
             if (d == oa::runtime::FilterDecision::Consume ||
                 (!has_builtin && d != oa::runtime::FilterDecision::Missing)) {
                 return out; // consumed by Lua
@@ -2094,7 +2298,24 @@ static TagOutcome execute_tag(Interpreter& it, const Instruction& ins, bool appl
             return out;
         }
         const auto line = cur_script->get_label_line(label);
-        if (!line) throw ScriptError("label", "jump: label not found: " + label, ins.line);
+        if (!line) {
+            // 无 file 的跳转：发起脚本（排队 tag 是 origin，内联是当前脚本）
+            // 没有这个 label 时，按确定性的命名空间规则继续
+            // （resolve_label_from：发起脚本 → 调用栈由内向外 → 框架脚本排序）。
+            const std::string context =
+                ins.origin_script.empty() ? *it.current_script() : ins.origin_script;
+            std::string fallback_file;
+            size_t fallback_line = 0;
+            if (ins.origin_script.empty() &&
+                it.resolve_label_from(context, label, &fallback_file, &fallback_line) &&
+                fallback_file != *it.current_script()) {
+                out.kind = TagOutcomeKind::JumpExternal;
+                out.file = std::move(fallback_file);
+                out.label = label;
+                return out;
+            }
+            throw ScriptError("label", "jump: label not found: " + label, ins.line);
+        }
         out.kind = TagOutcomeKind::Jump;
         out.line = *line;
         return out;
@@ -2103,6 +2324,20 @@ static TagOutcome execute_tag(Interpreter& it, const Instruction& ins, bool appl
         out.kind = TagOutcomeKind::Call;
         out.file = eval.resolve_param_str(resolve_or_empty("file"));
         out.label = eval.resolve_param_str(resolve_or_empty("label"));
+        // 无 file 的 call：当前脚本没有这个 label 时走同一套命名空间规则。
+        // config_s.iet 的 goto_config_v → `[call label="mw_reprop"]` 就是这种
+        // （mw_reprop 在 config.iet；iMel 的 system/ 页面共享标签命名空间）。
+        if (out.file.empty() && !out.label.empty()) {
+            const std::string context =
+                ins.origin_script.empty() ? *it.current_script() : ins.origin_script;
+            std::string fallback_file;
+            size_t fallback_line = 0;
+            if (ins.origin_script.empty() &&
+                it.resolve_label_from(context, out.label, &fallback_file, &fallback_line) &&
+                fallback_file != *it.current_script()) {
+                out.file = std::move(fallback_file);
+            }
+        }
         out.return_line = it.current_line() + 1;
         out.return_script = *it.current_script();
         return out;
@@ -2117,8 +2352,8 @@ static TagOutcome execute_tag(Interpreter& it, const Instruction& ins, bool appl
         // Lua 排队的 [stop] 是框架自己排的"等人"步骤（关 backlog 时
         // system/ui.asb 的 call_ui_stop），点击放行，否则回不到剧情。
         Wait w;
-        w.release = Wait::OnDecide;
-        if (!ins.origin_script.empty()) w.release |= Wait::OnClick;
+        w.wakes = Wait::WakeSkip | Wait::WakeDecide;
+        if (!ins.origin_script.empty()) w.wakes |= Wait::WakeClick;
         w.stage_id = resolve_or_empty("0");
         w.ends_exskip = w.stage_id == "exskip";
         out.kind = TagOutcomeKind::WaitEvent;
@@ -2131,12 +2366,12 @@ static TagOutcome execute_tag(Interpreter& it, const Instruction& ins, bool appl
         const std::string wt_time = resolve_or_empty("time");
         const std::string wt_input = resolve_or_empty("input");
         if (wt_time.empty() && wt_input.empty()) {
-            w.release = Wait::OnClick | Wait::OnSkip;
+            w.wakes = Wait::WakeSkip | Wait::WakeClick;
         } else {
             w.timer_ms = eval.resolve_param(wt_time).as_int().value_or(0);
             const int64_t input = eval.resolve_param(wt_input).as_int().value_or(1);
-            w.release = Wait::OnSkip;
-            if (input == 1) w.release |= Wait::OnClick | Wait::OnDecide;
+            w.wakes = Wait::WakeSkip;
+            if (input == 1) w.wakes |= Wait::WakeClick | Wait::WakeDecide;
         }
         out.kind = TagOutcomeKind::WaitEvent;
         out.event = Event::park_on(std::move(w));
@@ -2147,15 +2382,14 @@ static TagOutcome execute_tag(Interpreter& it, const Instruction& ins, bool appl
         // [click]: クリック待ち — ADV 的一页结束。等待点击（脚本决定/跳过/自动
         // 也能放行），页面逐字未完成时由输入侧先补完整页。
         Wait w;
-        w.release = Wait::OnClick | Wait::OnDecide | Wait::OnSkip | Wait::OnAuto;
+        w.wakes = Wait::WakeSkip | Wait::WakeClick | Wait::WakeDecide | Wait::WakeAuto;
         out.kind = TagOutcomeKind::WaitEvent;
         out.event = Event::park_on(std::move(w));
         return out;
     }
     if (tag == "wt0") {
         Wait w;
-        w.release = Wait::OnClick | Wait::OnDecide | Wait::OnSkip |
-                    Wait::OnAuto;
+        w.wakes = Wait::WakeSkip | Wait::WakeClick | Wait::WakeDecide | Wait::WakeAuto;
         out.kind = TagOutcomeKind::WaitEvent;
         out.event = Event::park_on(std::move(w));
         return out;
@@ -2172,7 +2406,7 @@ static TagOutcome execute_tag(Interpreter& it, const Instruction& ins, bool appl
         if (ins.has("canskip")) {
             input = eval.resolve_param(resolve_or_empty("canskip")).as_int().value_or(1);
         }
-        w.release = Wait::OnSkip;
+        w.wakes = Wait::WakeSkip;
         if (!video.empty()) {
             w.stage = Wait::Stage::VideoLayer;
             w.stage_id = video;
@@ -2189,14 +2423,14 @@ static TagOutcome execute_tag(Interpreter& it, const Instruction& ins, bool appl
                 w.se_time_ms = time;
                 w.se_time_given = true; // counts from the SE play start
             }
-            if (input == 1) w.release |= Wait::OnClick | Wait::OnDecide;
+            if (input == 1) w.wakes |= Wait::WakeClick | Wait::WakeDecide;
         } else if (!name.empty()) {
             w.custom_name = name;
             if (time > 0) w.timer_ms = int64_t(time);
-            if (input == 1) w.release |= Wait::OnClick | Wait::OnDecide;
+            if (input == 1) w.wakes |= Wait::WakeClick | Wait::WakeDecide;
         } else {
             w.timer_ms = int64_t(time);
-            if (input == 1) w.release |= Wait::OnClick | Wait::OnDecide;
+            if (input == 1) w.wakes |= Wait::WakeClick | Wait::WakeDecide;
         }
         out.kind = TagOutcomeKind::WaitEvent;
         out.event = Event::park_on(std::move(w));
@@ -2209,7 +2443,7 @@ static TagOutcome execute_tag(Interpreter& it, const Instruction& ins, bool appl
     }
     if (tag == "exkey") {
         Wait w;
-        w.release = Wait::OnClick | Wait::OnDecide | Wait::OnSkip;
+        w.wakes = Wait::WakeSkip | Wait::WakeClick | Wait::WakeDecide;
         auto add_key = [&w](const std::string& btn) {
             int code = 0;
             try {
@@ -2229,8 +2463,7 @@ static TagOutcome execute_tag(Interpreter& it, const Instruction& ins, bool appl
     }
     if (tag == "@") {
         Wait w;
-        w.release = Wait::OnClick | Wait::OnDecide | Wait::OnSkip |
-                    Wait::OnAuto;
+        w.wakes = Wait::WakeSkip | Wait::WakeClick | Wait::WakeDecide | Wait::WakeAuto;
         out.kind = TagOutcomeKind::WaitEvent;
         out.event = Event::park_on(std::move(w));
         out.event.tag = tag;
@@ -2403,7 +2636,7 @@ static TagOutcome execute_tag(Interpreter& it, const Instruction& ins, bool appl
             return out;
         }
         if (tag == "print") {
-            it.note_page_printed();
+            it.note_text_position(); // 既读判定（框架在 print 过滤器里抄走）
             const std::string raw = resolve_or_empty("data");
             std::string text = raw;
             if (!raw.empty() && raw.front() == '$') {
@@ -2515,9 +2748,9 @@ static TagOutcome execute_tag(Interpreter& it, const Instruction& ins, bool appl
         }
         // Remaining runtime-confirmed native tags: config/audio/UI markers.
         static const char* kConfigTags[] = {
-            "skip", "automode", "autosave", "alreadyread",
+            "skip", "automode", "autosave", "alreadyread", "avoid",
             "hide", "rclick", "keyconfig", "mouse", "caption",
-            "exec", "save", "delonpush", "setonpush", "setonclick",
+            "exec", "delonpush", "setonpush", "setonclick",
             "setondrag", "setondragin", "setondragout", "setonrollover",
             "setonrollout", "delonclick", "delondrag", "delondragin",
             "delondragout", "delonrollover", "delonrollout",
@@ -2605,7 +2838,51 @@ static TagOutcome execute_tag(Interpreter& it, const Instruction& ins, bool appl
         }
     }
 
+    // Engine storage tags. They are host-side, not "unknown": save/load are
+    // the **same operation** (store/restore a SavePoint), and qsave/qload are
+    // the framework calling the same tag on a fixed file.
+    if (tag == "save" || tag == "load" || tag == "syssave" || tag == "autosave" ||
+        tag == "takess" || tag == "savess" || tag == "file") {
+        out.kind = TagOutcomeKind::CustomEvent;
+        out.event = Event::custom(tag, ins.params);
+        // 文件名/参数是表达式（`$g.savedata.prefix + 'save_' + savenum`）。
+        for (auto& [k, v] : out.event.params) {
+            if (!v.empty() && v.front() == '$') {
+                try {
+                    v = eval.resolve_param_str(v);
+                } catch (const std::exception&) {
+                    // 保留原文：宿主会打印可判定的错误，不会静默写错文件。
+                }
+            }
+        }
+        // `[save]` must record the execution context **at issue time**:
+        //  * inline script tag: the script advances past it → line + 1;
+        //  * queued by a tag filter (iMel): the drain already sits on line+1;
+        //  * Lua e:tag (FPM quicksave): stays on the current park line.
+        if (tag == "save" && it.current_script()) {
+            if (std::getenv("OA_SAVE_TRACE")) {
+                std::fprintf(stderr, "[saveorigin] execute save at %s@%zu from_script=%d\n",
+                             it.current_script()->c_str(), it.current_line(), int(from_script));
+            }
+            auto origin = std::make_shared<SaveOrigin>();
+            origin->script = *it.current_script();
+            origin->line = it.current_line() + (from_script ? 1 : 0);
+            for (const auto& f : it.call_stack()) {
+                origin->call_stack.emplace_back(f.script, f.return_line);
+                if (!f.script.empty() && !oa::runtime::is_framework_script(f.script))
+                    origin->story_call_line = f.call_line;
+            }
+            out.event.save_origin = std::move(origin);
+        }
+        return out;
+    }
+
     // Unknown tag -> Event::Custom (fallback).
+    //
+    // 顺手记一笔：宿主会把它写进日志并提示一次。以前这里静默返回一个没人
+    // 接的事件 —— `[tag data="print,..."]` 就是这么被吞掉的，回顾页的行框
+    // 全建好、一个字没印，从外表看像"字体没加载"。
+    it.note_unknown_tag(tag);
     out.kind = TagOutcomeKind::CustomEvent;
     out.event = Event::custom(tag, ins.params);
     return out;
@@ -2640,7 +2917,7 @@ bool Interpreter::run_tag_now(const std::string& tag,
     ++immediate_tag_depth_;
     TagOutcome outcome;
     try {
-        outcome = execute_tag(*this, ins, false);
+        outcome = execute_tag(*this, ins, false, /*from_script=*/false);
     } catch (const std::exception& e) {
         --immediate_tag_depth_;
         std::fprintf(stderr, "[tag-now] %s failed: %s\n", tag.c_str(), e.what());
@@ -2751,6 +3028,10 @@ ExecutionResult Interpreter::run() {
         // Scenario story text.
         if (ins.kind == Instruction::Kind::Text) {
             const std::string text = ins.get_or("text", "");
+            // 既读判定必须在文本过滤器（框架的 print_text）之前落到
+            // s.status.alreadyread：框架在 print_text 里把它抄进 scr.adv.aread，
+            // 之后整页不再刷新（skip 按钮的 enable/文字已读色都看这个值）。
+            note_text_position();
             // A scenario text row is `[print data="<row>"]` as far as the
             if (dispatch_text_row_to_print_filter(text)) {
                 ++current_line_;
@@ -2785,10 +3066,22 @@ ExecutionResult Interpreter::run() {
             continue;
         }
 
-        const TagOutcome outcome = execute_tag(*this, ins, true);
+        const std::string script_before = *current_script_name_;
+        const size_t line_before = current_line_;
+        const size_t stack_before = call_stack_.size();
+        const TagOutcome outcome = execute_tag(*this, ins, true, /*from_script=*/true);
 
         switch (outcome.kind) {
             case TagOutcomeKind::Continue:
+                // 过滤器自己可能已经把控制流挪走（框架 `[returns]` 的
+                // `tagFilters["return"]` → `e:tag{"return"}` 会立即弹帧并
+                // 落到调用者的 `[jump …]` 行）。那一步就是"这条 tag 的
+                // 结果"，不能再 +1 —— 否则落点的第一条指令被跳过
+                // （backlog「戻る」→ menu 的 `[jump leave]` 被吞掉，收尾
+                // 直接掉进下一个流程）。
+                if (*current_script_name_ != script_before || current_line_ != line_before ||
+                    call_stack_.size() != stack_before)
+                    continue;
                 ++current_line_;
                 continue;
             case TagOutcomeKind::Jump:
@@ -2820,8 +3113,12 @@ ExecutionResult Interpreter::run() {
                 if (call_stack_.size() >= 512) {
                     throw ScriptError("call", "call: stack too deep (512)", ins.line);
                 }
-                call_stack_.push_back(
-                    CallFrame{outcome.return_script, outcome.return_line, next_frame_id_++});
+                CallFrame frame;
+                frame.script = outcome.return_script;
+                frame.return_line = outcome.return_line;
+                frame.id = next_frame_id_++;
+                frame.call_line = current_line_;
+                call_stack_.push_back(std::move(frame));
                 save_frame_queue();
                 if (hooks_.frame_pushed) hooks_.frame_pushed();
                 const std::string target_script = outcome.file.empty() ? *current_script_name_
@@ -2981,15 +3278,26 @@ oa::runtime::LuaHost Interpreter::build_lua_host() {
         variables_.set(name, std::move(v));
     };
     host.enqueue_tag = [this](std::string tag, std::map<std::string, std::string> params) {
-        if (std::getenv("OA_LOADDBG"))
-            std::fprintf(stderr, "[ld] enqueue %s (queue=%zu)\n", tag.c_str(),
-                         tag_queue_.size());
         Instruction ins;
         ins.tag = std::move(tag);
         ins.params = std::move(params);
+        if (std::getenv("OA_LOADDBG")) {
+            const auto lb = ins.params.find("label");
+            std::fprintf(stderr, "[ld] enqueue %s (queue=%zu) at=%s@%zu label='%s'\n",
+                         ins.tag.c_str(), tag_queue_.size(),
+                         current_script_name_ ? current_script_name_->c_str() : "", current_line_,
+                         lb == ins.params.end() ? "" : lb->second.c_str());
+        }
         ins.line = 0;
         if (in_handler_frame()) ins.floor_depth = logical_depth();
         if (current_script_name_) ins.origin_script = *current_script_name_;
+        // 过滤器自己重新投递的命令必须原样执行（见 Instruction::skip_filter），
+        // 并原位插回队首（splice_filter_emitted）。
+        ins.skip_filter = lua_bridge_ && lua_bridge_->in_tag_filter();
+        if (ins.skip_filter) {
+            filter_emitted_.push_back(std::move(ins));
+            return;
+        }
         tag_queue_.push_back(std::move(ins));
     };
     // Lua-originated e:tag{"calllua",...} runs synchronously,
@@ -3050,8 +3358,17 @@ oa::runtime::LuaHost Interpreter::build_lua_host() {
             // 事件处理帧 / 排队 [jump] 压出来的回程帧对外都是空文件名：框架的
             // ReturnStack()/ReturnStackAll() 靠 `file == ""` 认出"该收掉这一层
             // UI"，并发 [return] 把它关掉。
+            //
+            // index = **这一帧当前停在哪条指令**（官方 BOWS 的 frame.current）。
+            // 帧正在等一个 [call] 返回时，它停在那条 `[call]`（call_line），
+            // 不是返回点（return_line）。框架的 backlogjump_countup 用
+            // `stack[i].index` 记"这一页的剧本位置"，returns/ReturnStack 用
+            // `index - 1` 再取 `getScriptBlock` 看停在哪个 tag —— 两处都要
+            // call_line。报 return_line 会让回顾跳转的目标索引整体晚一页
+            // （快进到下一页才 >= 目标）。
+            const size_t at = frame.call_line != 0 ? frame.call_line : frame.return_line;
             out.emplace_back(anonymous(frame) ? std::string() : frame.script,
-                             top && anonymous(frame) ? current_line_ : frame.return_line);
+                             top && anonymous(frame) ? current_line_ : at);
         }
         // 栈顶是真实脚本位置时才追加一条；匿名帧已经代表"当前位置"，
         // 再追加会把 "" 挤出栈顶（框架就认不出来了）。
@@ -3124,14 +3441,19 @@ void Interpreter::seed_engine_variables_impl() {
 }
 
 bool Interpreter::fire_event(const std::string& event_name) {
+    return fire_event(event_name, {});
+}
+
+bool Interpreter::fire_event(const std::string& event_name,
+                             const std::map<std::string, std::string>& params) {
     const auto it = event_handlers_.find(event_name);
     if (it == event_handlers_.end() || it->second.empty()) return false;
     // Event handlers follow the FPM (e, p) convention (store/restore/
     // keyClickStart/exskip_end take the engine object as their first
     // argument, like calllua rows); call_function passes the engine handle
-    // + an empty params table. Zero-arg handlers (vsync) ignore the extras.
+    // + the params table. Zero-arg handlers (vsync) ignore the extras.
     try {
-        lua_bridge().call_function(it->second, {});
+        lua_bridge().call_function(it->second, params);
     } catch (const oa::runtime::LuaError& e) {
         // research/130: engine->script event (onEnterFrame=vsync, onSave=store,
         // ...). One failing event abandons the dispatch; the frame loop keeps
@@ -3292,8 +3614,25 @@ bool Interpreter::apply_var(const std::map<std::string, std::string>& params) {
         }
         variables_.set(name + ".size", Value::make_int((long long)parts.size()));
         for (size_t i = 0; i < parts.size(); ++i) {
+            // CSV/分解值的数值语义：纯整数 token 落成 Int（原版变量是弱类型，
+            // 布局 CSV `slot_margin = 100,13` 之后要 `margin + width` 做算术）。
+            // 只认**规范整数**：带小数点的 token（层 id "110.10"、
+            // "1.80.mw.-1"）保持字符串，否则 110.10 会变成 110.1，层 id 对不上。
+            const std::string& p = parts[i];
+            bool is_int = !p.empty();
+            size_t d = 0;
+            if (p[0] == '-') d = 1;
+            if (d >= p.size()) is_int = false;
+            for (size_t k = d; is_int && k < p.size(); ++k)
+                if (p[k] < '0' || p[k] > '9') is_int = false;
+            int64_t iv = 0;
+            if (is_int) {
+                const auto r = std::from_chars(p.data() + d, p.data() + p.size(), iv);
+                is_int = r.ec == std::errc() && r.ptr == p.data() + p.size();
+                if (is_int && d == 1) iv = -iv;
+            }
             variables_.set(name + "." + std::to_string(i),
-                           Value::make_string(parts[i]));
+                           is_int ? Value::make_int(iv) : Value::make_string(p));
         }
         return true;
     }
@@ -3387,8 +3726,12 @@ std::optional<ExecutionResult> Interpreter::flush_tag_queue() {
         // 后面的队列属于下一步，不能抢在停驻前面跑。
         if (auto parked = take_immediate_park()) return parked;
         if (std::getenv("OA_LOADDBG"))
-            std::fprintf(stderr, "[ld] drain %s (left=%zu)\n", tag_queue_.front().tag.c_str(),
-                         tag_queue_.size());
+            std::fprintf(stderr, "[ld] drain %s (left=%zu) at=%s@%zu origin='%s' label='%s'\n",
+                         tag_queue_.front().tag.c_str(), tag_queue_.size(),
+                         current_script_name_ ? current_script_name_->c_str() : "",
+                         current_line_, tag_queue_.front().origin_script.c_str(),
+                         tag_queue_.front().get("label") ? tag_queue_.front().get("label")->c_str()
+                                                         : "");
         Instruction ins = std::move(tag_queue_.front());
         tag_queue_.erase(tag_queue_.begin());
         if (on_step) on_step(*current_script_name_, current_line_, ins);
@@ -3397,15 +3740,58 @@ std::optional<ExecutionResult> Interpreter::flush_tag_queue() {
         // the surrounding [return] burst — macro.iet's returnjump queues
         // [jump label=lydialog_exec] from inside lyldialog.iet, and resolving
         // it against the caller (config.iet) aborted with "label not found".
-        if ((ins.tag == "jump" || ins.tag == "goto" || ins.tag == "call") &&
-            !ins.get("file") && !ins.get("index") && !ins.origin_script.empty() &&
+        //
+        // 但框架还有**相反**的写法：`[lydialog]` 宏在 caller（dialog.iet）里
+        // 排一条 `[jump label="lydialog_exec"]`，紧接着 caller 自己就 `[return]`，
+        // 那条 jump 的落点是弹回 ly dialog.iet 之后的位置（原版把它存在帧的
+        // reservedCommands 里，帧结束才跑）。抢在 `[return]` 前面执行时两个
+        // 脚本都没有这个标签 —— 以前直接抛 ScriptError，整个 tick 返回 Error，
+        // 玩家看到的就是"点快一点就闪退"（语言页/设置页的连点重入都会踩到）。
+        //
+        // 规则：先按**当前**脚本解析（正常的同文件跳转），再退回排下它的脚本
+        // （跨文件宏）；两边都没有就把它留在队首，让脚本自己先往下走 —— 通常
+        // 下一行就是那条 [return]，弹帧时 restore_frame_queue 会把它交给
+        // caller，那边才有这个标签。
+        if ((ins.tag == "jump" || ins.tag == "goto") && !ins.get("file") && !ins.get("index") &&
             ins.get("label")) {
+            const std::string label = *ins.get("label");
+            auto script_has_label = [this, &label](const std::string& name) {
+                if (name.empty()) return false;
+                const Script* s = get_script(name);
+                return s && s->get_label_line(label).has_value();
+            };
+            const std::string here = current_script_name_ ? *current_script_name_ : std::string();
+            if (!script_has_label(here)) {
+                if (script_has_label(ins.origin_script)) {
+                    ins.params["file"] = ins.origin_script;
+                } else {
+                    tag_queue_.insert(tag_queue_.begin(), std::move(ins));
+                    return std::nullopt; // 让当前帧先跑完（多半是 [return]）
+                }
+            }
+        } else if ((ins.tag == "jump" || ins.tag == "goto" || ins.tag == "call") &&
+                   !ins.get("file") && !ins.get("index") && !ins.origin_script.empty() &&
+                   ins.get("label")) {
             const Script* origin = get_script(ins.origin_script);
             if (origin && origin->get_label_line(*ins.get("label"))) {
                 ins.params["file"] = ins.origin_script;
             }
         }
-        const TagOutcome outcome = execute_tag(*this, ins, false);
+        // 队列 tag 默认按原样执行（框架的 stop/var/lyc 过滤器会自己再投递
+        // 一次，对排队命令重复套用会多停一拍）。例外是**带输入掩码的转场**：
+        // 框架的 trans 过滤器就是 t.eventfilter 的唯一复位点，而 sysbtn 的
+        // 子菜单转场是 Lua `e:enqueueTag{"trans"}` 排下的 —— 不套过滤器时
+        // 掩码永远停在 1，dock 建好的按钮一个都点不动。掩码为 0（或这个
+        // 框架根本没有掩码，例如 script.asb 系）时保持原样，避免过滤器额外
+        // 注入的 wait 改变无关动画的节拍。过滤器内部重投递的真转场带
+        // skip_filter，不会递归。
+        bool mask_armed = false;
+        if (const auto maskv = variables_.get("t.eventfilter")) {
+            mask_armed = maskv->to_display() != "0";
+        }
+        const bool run_filter =
+            !ins.skip_filter && ins.tag == "trans" && mask_armed;
+        const TagOutcome outcome = execute_tag(*this, ins, run_filter, /*from_script=*/false);
         switch (outcome.kind) {
             case TagOutcomeKind::Continue:
                 continue;
@@ -3474,17 +3860,14 @@ std::optional<ExecutionResult> Interpreter::flush_tag_queue() {
                     throw ScriptError("call", "call: stack too deep (512)", 0);
                 }
                 // queued call: return_line = current_line (do NOT add 1)
-                const size_t pinned = call_stack_.size();
                 const uint64_t frame_id = next_frame_id_++;
-                // 队列归帧：排在 [call] 后面的 tag 属于调用者，存进它的那一层；
-                // 被调方从空队列开始（除非这个框架方言把队列交给被调方）。
-                if (outcome.label.empty()) save_frame_queue();
-                call_stack_.push_back(CallFrame{*current_script_name_, current_line_, frame_id});
-                (void)pinned;
-                // A handler-issued call takes the current execution over: the
-                // frame push moves the live park into the context stack, so the
-                // caller resumes exactly where it was on [return].
-                if (hooks_.frame_pushed) hooks_.frame_pushed();
+                // 队列归帧：排在 [call] 后面的 tag 属于调用者，必须等被调方
+                // [return] 之后才执行（原版 reservedCommands 就是这个顺序）。
+                // 以前只对**无标签**的 call 暂存，带标签的宏 call 会先被
+                // 连续 drain 成多层帧、再按 LIFO 跑 body —— 框架一次排下
+                // `sysbtn_del / sysbtn_init / sysbtn_set` 时实际顺序变成
+                // set→init→del，最后 del 把刚建好的按钮整棵删掉（dock 打开
+                // 后菜单不出现）。
                 const std::string target = outcome.file.empty() ? *current_script_name_
                                                                 : outcome.file;
                 if (!outcome.file.empty()) load_external_script(target);
@@ -3493,12 +3876,41 @@ std::optional<ExecutionResult> Interpreter::flush_tag_queue() {
                 if (!line) {
                     throw ScriptError("label", "call: label not found: " + outcome.label, 0);
                 }
+                // 框架的「ダミーコール」作用域（macro.iet *dummy / *dm）：
+                //   e:tag{"call", file, label="dummy"} … e:tag{"return"}
+                // call 只负责压一层局部变量作用域，真正的收尾是同一批排队
+                // tag 末尾的 [return]。绝不能进入 dummy 体：它本身就是一个
+                // [return]，会把作用域提前弹掉，队列里的 [return] 随即弹穿
+                // 调用者（共通終了処理/タイトルバック 都被弹回菜单，[exit]/
+                // [reset] 永远走不到）。这里压一个**空队列**帧，让调用者的
+                // 队列继续在这层作用域上排空，由那条 [return] 正常弹回。
+                const bool bare_return_label =
+                    *line < t->instructions.size() && t->instructions[*line].tag == "return";
+                // 只有当同一批排队 tag 里还有收尾的 [return] 时才按"作用域"
+                // 处理；没有 return 的 dummy call 走普通调用（body 自弹）。
+                const bool scope_call =
+                    bare_return_label &&
+                    std::any_of(tag_queue_.begin(), tag_queue_.end(),
+                                [](const Instruction& q) { return q.tag == "return"; });
+                CallFrame qframe;
+                qframe.script = *current_script_name_;
+                qframe.return_line = current_line_;
+                qframe.id = frame_id;
+                qframe.call_line = current_line_;
+                if (scope_call) {
+                    queue_stack_.emplace_back();
+                    call_stack_.push_back(std::move(qframe));
+                } else {
+                    save_frame_queue();
+                    call_stack_.push_back(std::move(qframe));
+                }
+                // A handler-issued call takes the current execution over: the
+                // frame push moves the live park into the context stack, so the
+                // caller resumes exactly where it was on [return].
+                if (hooks_.frame_pushed) hooks_.frame_pushed();
                 current_script_name_ = target;
                 current_line_ = *line;
                 arrived_by_jump_ = true;
-                // FPM 方言不带 hold：带标签的队列 [call] 把调用者的剩余 tag
-                // 一起接管（estag 的整段 UI 入口是一个突发）。其它方言的
-                // tag 留在调用者那一层，被调方从空队列开始。
                 continue;
             }
             case TagOutcomeKind::Return: {
@@ -3553,7 +3965,7 @@ void Interpreter::flush_pending_text_tags() {
         Instruction ins = std::move(tag_queue_[i]);
         tag_queue_.erase(tag_queue_.begin() + i);
         if (on_step) on_step(*current_script_name_, current_line_, ins);
-        const TagOutcome outcome = execute_tag(*this, ins, false);
+        const TagOutcome outcome = execute_tag(*this, ins, false, /*from_script=*/false);
         switch (outcome.kind) {
             case TagOutcomeKind::Continue:
                 break;

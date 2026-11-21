@@ -333,6 +333,9 @@ void AudioEngine::set_bgm_volume(float volume) {
 void AudioEngine::set_se_volume(float volume) {
     state_.se_volume = volume < 0.0f ? 0.0f : (volume > 1.0f ? 1.0f : volume);
 }
+void AudioEngine::set_voice_volume(float volume) {
+    state_.voice_volume = volume < 0.0f ? 0.0f : (volume > 1.0f ? 1.0f : volume);
+}
 
 void AudioEngine::set_skipping(bool skipping) { state_.is_skipping = skipping; }
 
@@ -619,7 +622,16 @@ struct MixDiag {
     int bgm_silent = 0;
 };
 MixDiag& g_mix_diag() {
-    static MixDiag d;
+    static MixDiag d = [] {
+        MixDiag m;
+        const char* e = std::getenv("OA_AUDIO_MIXDIAG");
+        m.enabled = e && *e && *e != '0';
+        if (const char* ms = std::getenv("OA_AUDIO_MIXDIAG_MS")) {
+            const long long v = std::atoll(ms);
+            if (v > 0) m.bucket_frames = uint64_t(double(MediaPlayers::kOutputRate) * double(v) / 1000.0);
+        }
+        return m;
+    }();
     return d;
 }
 double db_fs(double amplitude) {
@@ -1434,6 +1446,16 @@ void MediaPlayers::push_video_audio(const float* interleaved_stereo, size_t fram
     capture_movie(src, frames); // movie stream signal face
     sink_->push_movie(src, frames); // bounded: kMovieBoundFrames
 }
+bool MediaPlayers::decode_progress(SoundCategory cat, const std::string& id, double* seconds,
+                                   bool* unplayable) const {
+    const auto it = players_.find(channel_key(cat, id));
+    if (it == players_.end() || !it->second) return false;
+    const Player& p = *it->second;
+    if (seconds) *seconds = p.rate > 0.0 ? p.p / p.rate : 0.0;
+    if (unplayable) *unplayable = p.unplayable || p.silent_forever;
+    return true;
+}
+
 void MediaPlayers::update(uint64_t delta_ms, AudioEngine& engine, const FinishFn& on_finish) {
     // Output frames for this tick (44100 Hz clock).
     out_frame_frac_ += double(delta_ms) * double(kOutputRate) / 1000.0;

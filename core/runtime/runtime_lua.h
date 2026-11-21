@@ -80,8 +80,15 @@ struct LuaHost {
     /// return filter (macro.iet tagFilters["return"]) inspects the row the
     /// return lands on to decide whether to reset eventfilter; the previous
     /// nil stub crashed it with "attempt to index local 'currentTag'".
-    std::function<std::optional<std::pair<std::string,
-        std::map<std::string, std::string>>>(const std::string& file, size_t index)>
+    struct ScriptBlock {
+        std::string command;
+        std::map<std::string, std::string> params;
+        /// 该行的**脚本源码行号**（不是指令序号）。框架的自动缓存用
+        /// `e:getScriptBlock(frame).line` 记住"读到第几行"，缺这个字段
+        /// 会在 syscache.iet 里 `tonumber(nil)` 崩掉整条缓存链。
+        size_t line = 0;
+    };
+    std::function<std::optional<ScriptBlock>(const std::string& file, size_t index)>
         script_block;
     /// FPM e:debugSkip (次の選択肢に進む / 高速スキップ; select.lua
     /// goNextSelectLoop). index = 99999 in FPM calls. Wired by GameRuntime to
@@ -156,6 +163,10 @@ public:
     /// The interpreter uses this to decide whether a scenario text row has a
     /// framework `print` handler to consult (iMel multi-language).
     bool has_tag_filters() const;
+    /// 当前是否正在执行一个 tag filter。过滤器内部用 e:tag/e:enqueueTag
+    /// 重新投递"真正的命令"（trans/wait/stop 都这么写），那些命令必须按
+    /// 原样执行，不能再被同一条过滤器接住 —— 队列侧据此打 skip_filter。
+    bool in_tag_filter() const { return tag_filter_depth_ > 0; }
 
     /// e:setEventFilter dispatch: calls the stored eventFilter(e, name,
     /// params). Returns
@@ -199,6 +210,8 @@ private:
 
     /// luaL_ref handles for filter callbacks (LUA_NOREF = not installed).
     int tag_filter_ref_;
+    /// 正在执行的 tag filter 层数（过滤器里 e:tag / e:enqueueTag 的判据）。
+    int tag_filter_depth_ = 0;
     int event_filter_ref_;
     /// Log filter is a plain integer (0 = raw, 1 = suppressed); no Lua ref.
     int log_filter_value_;

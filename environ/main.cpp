@@ -4,22 +4,29 @@
 #include <SDL3/SDL_main.h>
 
 #include <SDL3/SDL_events.h>
+#include <SDL3/SDL_filesystem.h>
 #include <SDL3/SDL_hints.h>
 #include <SDL3/SDL_init.h>
 #include <SDL3/SDL_keycode.h>
+#include <SDL3/SDL_messagebox.h>
 #include <SDL3/SDL_mouse.h>
 #include <SDL3/SDL_touch.h>
 #include <SDL3/SDL_video.h>
 
+#include <algorithm>
 #include <cerrno>
 #include <cstdio>
 #include <cstdlib>
+#include <ctime>
 #include <filesystem>
 #include <map>
+#include <set>
 #include <string>
 #include <utility>
+#include <vector>
 
 #include "core/runtime/runtime.h"
+#include "core/runtime/runtime_game.h"
 #include "platform/Platform.h"
 
 namespace {
@@ -39,6 +46,9 @@ struct HostState {
     SDL_Window* window = nullptr;
     bool sdl_inited = false;
     bool plat_inited = false;
+    bool error_reported = false;
+    /// 已经弹过提示的"未实现指令"（同一名字只提示一次）。
+    std::set<std::string> reported_unknown;
 
     TouchPhase touch_phase = TouchPhase::Idle;
     std::map<SDL_FingerID, TouchFinger> fingers;
@@ -46,6 +56,113 @@ struct HostState {
     float pending_x = 0.0f;
     float pending_y = 0.0f;
 };
+
+// 引擎不认识的指令：写日志 + 提示一次。
+//
+// 静默吞掉的后果是"页面出来了但没字""按钮点了没反应"这类哑故障 ——
+// `[tag data="print,..."]` 就是这么丢了很久（回顾页只剩空行框）。宁可
+// 打断一下，也要让"某条指令没实现"这件事可见。
+void report_unknown_tags(HostState* host)
+{
+    return; // 无阻碍模式
+    if (!host || !host->app) return;
+    auto& rt = host->app->runtime();
+    const auto& unknown = rt.interpreter().unknown_tags();
+    if (unknown.empty()) return;
+
+    std::vector<std::string> fresh;
+    for (const auto& [name, count] : unknown) {
+        (void)count;
+        if (host->reported_unknown.insert(name).second) fresh.push_back(name);
+    }
+    if (fresh.empty()) return;
+
+    std::sort(fresh.begin(), fresh.end());
+    const std::string* script = rt.interpreter().current_script();
+    const std::string where = script ? *script + ":" + std::to_string(rt.interpreter().current_line())
+                                     : std::string();
+
+    // 日志
+    std::string log_path;
+    {
+        std::string dir;
+        if (const char* base = SDL_GetBasePath()) dir = base;
+        if (dir.empty()) {
+            std::error_code ec;
+            dir = std::filesystem::current_path(ec).string();
+        }
+        if (!dir.empty()) log_path = dir + "oa_error.log";
+    }
+    if (!log_path.empty()) {
+        if (std::FILE* f = std::fopen(log_path.c_str(), "a")) {
+            char stamp[32] = "";
+            const std::time_t now = std::time(nullptr);
+            std::tm tmv{};
+            if (localtime_s(&tmv, &now) == 0) std::strftime(stamp, sizeof(stamp), "%F %T", &tmv);
+            for (const std::string& name : fresh)
+                std::fprintf(f, "[%s] unknown tag: %s (at %s)\n", stamp, name.c_str(),
+                             where.c_str());
+            std::fclose(f);
+        }
+    }
+
+    std::string msg = "以下指令本引擎还没有实现，相关表现可能缺失：\n\n";
+    for (size_t i = 0; i < fresh.size() && i < 12; ++i) {
+        msg += "  • " + fresh[i] + "\n";
+    }
+    if (fresh.size() > 12) msg += "  … 共 " + std::to_string(fresh.size()) + " 个\n";
+    if (!where.empty()) msg += "\n位置: " + where;
+    if (!log_path.empty()) msg += "\n日志: " + log_path;
+    SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_WARNING, "openartemis 未实现指令", msg.c_str(),
+                             host->window);
+}
+
+// 脚本/引擎错误不再让窗口无声消失：写一行日志，然后弹一个原生对话框告诉
+// 玩家发生了什么、日志在哪。没有这个之前，任何 ScriptError 都会让进程
+// 直接退出（玩家报的"点太快就闪退"）。
+void report_fatal_error(HostState* host)
+{
+    if (!host || !host->app || host->error_reported) return;
+    host->error_reported = true;
+
+    std::string what = host->app->last_error();
+    if (what.empty()) what = "unknown error";
+
+    // 出错位置（能取到就带上，日志里比弹窗更有用）。
+    std::string where;
+    auto& rt = host->app->runtime();
+    if (const std::string* s = rt.interpreter().current_script())
+        where = *s + ":" + std::to_string(rt.interpreter().current_line());
+
+    // 日志落在 exe 旁边（写不进去就退到当前目录）。
+    std::string log_path;
+    {
+        std::string dir;
+        if (const char* base = SDL_GetBasePath()) dir = base;
+        if (dir.empty()) {
+            std::error_code ec;
+            dir = std::filesystem::current_path(ec).string();
+        }
+        if (!dir.empty()) log_path = dir + "oa_error.log";
+    }
+    if (!log_path.empty()) {
+        if (std::FILE* f = std::fopen(log_path.c_str(), "a")) {
+            char stamp[32] = "";
+            const std::time_t now = std::time(nullptr);
+            std::tm tmv{};
+            if (localtime_s(&tmv, &now) == 0) std::strftime(stamp, sizeof(stamp), "%F %T", &tmv);
+            std::fprintf(f, "[%s] %s%s%s\n", stamp, what.c_str(), where.empty() ? "" : " @ ",
+                         where.c_str());
+            std::fclose(f);
+        }
+    }
+
+    std::string msg = "游戏遇到一个错误，已停止运行。\n\n" + what;
+    if (!where.empty()) msg += "\n位置: " + where;
+    if (!log_path.empty()) msg += "\n\n详细信息已写入:\n" + log_path;
+    SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, "openartemis 运行错误", msg.c_str(),
+                             host->window);
+}
 
 void print_usage(const char* argv0)
 {
@@ -431,11 +548,13 @@ SDL_AppResult SDL_AppIterate(void* appstate)
 
     switch (host->app->tick()) {
         case oa::runtime::AppResult::Continue:
+            report_unknown_tags(host);
             touch_flush_release(host);
             return SDL_APP_CONTINUE;
         case oa::runtime::AppResult::Exit:
             return SDL_APP_SUCCESS;
         case oa::runtime::AppResult::Error:
+            report_fatal_error(host);
             return SDL_APP_FAILURE;
     }
     return SDL_APP_FAILURE;

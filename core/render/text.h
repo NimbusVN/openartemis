@@ -73,7 +73,13 @@ public:
     /// 读档恢复的页：这一层下一次 `push_text` 是整页替换而不是追加
     /// （见 MessageLayer::reload_replace_pending）。
     void arm_reload_replace(const std::string& id);
-    void line_break(bool omit_blank_line);
+    /// `tag_params` 是 [rt] 的其余参数（例：`noveldummystart=1`），随
+    /// 重放命令串原样保存 —— 框架的 `vsave`/`scenarioRePrint` 靠它们分页。
+    void line_break(bool omit_blank_line,
+                    const std::map<std::string, std::string>& tag_params = {});
+    /// 结束当前页：`backlog` 决定这一页是否进回顾表（缺省按 write_mode）。
+    /// 页锚点/画面快照不在这里 —— 回顾跳转由框架自己的载体重放
+    /// （backlog_N.dat / log.stack / blj），引擎只保留这一页的重放命令。
     void page_break(std::optional<int> backlog_param);
     // ruby
     void ruby_start(const std::string& annotation);
@@ -84,6 +90,10 @@ public:
     void set_prohibit(const std::string& head, const std::string& foot);
     void set_wordparts(const std::string& parts);
     void set_indent(const std::string& pair);
+    /// 舞台宽：消息层既无字体表文本宽、又无绑定节点框宽时的折行兜底。
+    void set_stage_width(double w) { layout_cfg_.stage_width = w; }
+    /// 绑定节点框宽（消息窗可见文本区宽）。只在字体表 width 缺失时生效。
+    void set_message_box_width(const std::string& id, double w);
     // [scetween]
     void apply_scetween(const std::map<std::string, std::string>& p);
     // [glyph]
@@ -118,6 +128,33 @@ public:
     // backlog 查询
     size_t backlog_size() const { return backlog_pages_.size(); }
     std::optional<std::vector<std::string>> backlog_tags(size_t page, bool allfont) const;
+    /// 回顾页跳转：只保留前 `n` 页（Artemis 语义：跳到某页会截断其后
+    /// 已读内容，之后的回顾表不再出现）。
+    void truncate_backlog(size_t n) {
+        if (n < backlog_pages_.size()) {
+            backlog_pages_.resize(n);
+            bump_revision();
+        }
+    }
+    /// 跳转重放时，这一页已经在回顾表里了：它接下来那次 `[rp]` 不要再
+    /// 入库（否则每跳一次就多一条重复行）。只对指定层+页代号生效一次。
+    void skip_next_backlog_archive(std::string layer, uint64_t generation) {
+        skip_archive_ = true;
+        skip_archive_layer_ = std::move(layer);
+        skip_archive_generation_ = generation;
+    }
+    /// 存档：整份回顾表 + 写入开关（读档后脚本重建回顾页用）。
+    const std::vector<BacklogPage>& backlog_pages() const { return backlog_pages_; }
+    void set_backlog_pages(std::vector<BacklogPage> pages) {
+        backlog_pages_ = std::move(pages);
+        bump_revision();
+    }
+    bool backlog_write_mode() const { return backlog_write_mode_; }
+    bool backlog_allow() const { return backlog_allow_; }
+    void set_backlog_flags(bool write_mode, bool allow) {
+        backlog_write_mode_ = write_mode;
+        backlog_allow_ = allow;
+    }
     std::optional<std::vector<std::string>> message_tags(std::string_view id,
                                                          bool allfont) const;
 
@@ -161,6 +198,9 @@ private:
     bool backlog_allow_ = true;
     bool backlog_write_mode_ = false;
     bool backlog_include_font_ = true;
+    bool skip_archive_ = false;
+    std::string skip_archive_layer_;
+    uint64_t skip_archive_generation_ = 0;
     GlyphIconConfig glyph_icon_;
 };
 

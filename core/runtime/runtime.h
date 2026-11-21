@@ -50,6 +50,10 @@ public:
 
     AppResult tick();
 
+    /// 最近一次 tick 抛出的异常文本（空 = 没出错）。宿主用它弹窗 + 落盘，
+    /// 让脚本错误不再表现为"窗口无声消失"。
+    const std::string& last_error() const;
+
     /// 引擎本体（测试/调试用：读渲染队列、抓帧、注入状态）。
     /// 事件仍应走 mouse_*/key_event —— 那才是 main.cpp 的同一条路径。
     GameRuntime& runtime();

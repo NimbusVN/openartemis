@@ -10,6 +10,7 @@
 #include <vector>
 
 #include "core/fs/physfs_fs.h"
+#include "core/render/scene_snapshot.h"
 #include "core/runtime/runtime_iet.h"
 
 namespace oa::runtime {
@@ -40,54 +41,86 @@ struct AudioSnap {
     bool empty() const { return !bgm && se.empty() && voice.empty(); }
 };
 
-// --------------------------------------------------------------------------- Scene snapshot (openartemis-lite): verbatim layer props repla...
-struct LayerEventHandlerSnap {
-    std::string type; // "click" / "rollover" / "rollout" / "dragin" / ...
-    bool enabled = true;
-    bool penetration = false;
-    std::string handler;
-    std::string file;
-    std::string label;
-    bool call = false;
-    std::map<std::string, std::string> params;
-    std::map<std::string, std::string> filter_params;
-};
+// ---------------------------------------------------------------------------
+// 统一存档点（= 官方 BOWS 的语义，一份结构服务 save/qsave/autosave）：
+//
+//   SavePoint
+//     ├── 脚本栈    current_script / current_line / call_stack
+//     ├── 变量域    local_variables（**只有**无前缀 local；g./s./t. 不进来）
+//     ├── 画面      has_scene / root_props / layers（BOWS 字段 26）
+//     ├── 文本面    has_text / text_layers（BOWS 字段 24/25）
+//     └── 音频      has_audio / audio（BOWS 字段 29）
+//
+// 回顾跳转不在这份结构里存"每页一份画面"：框架自己保存载体
+// （t10 的 backlog_N.dat 就是一份本结构；t13 是 log.stack[].scr；
+//  NekoMiko 是 log.stack[].blj），跳转 = [load] 载体 + 脚本重放/快进。
+// ---------------------------------------------------------------------------
+using LayerEventHandlerSnap = oa::render::LayerEventHandlerSnap;
+using LayerSnap = oa::render::LayerSnap;
+using TextLayerSnap = oa::render::TextLayerSnap;
 
-struct LayerSnap {
-    std::string id;
-    std::map<std::string, std::string> props;
-    std::vector<LayerEventHandlerSnap> handlers;
-};
-
-/// One message layer's visible page. The text engine's stream is runtime structure (never part of the scene snapshot), so without this the w...
-struct TextLayerSnap {
-    std::string id;
-    bool active = false;
-    bool positioned = false;
-    double left = 0, top = 0, width = 0, height = 0;
-    std::map<std::string, std::string> font; // FontDesc::raw (box + face + size…)
-    std::string text;                        // flattened page, '\n' = line break
-    bool revealed = true;                    // fully revealed when saved
-};
-
-// --------------------------------------------------------------------------- One numbered save.
-struct SaveData {
-    int version = kSaveFormatVersion;
-    std::map<std::string, oa::runtime::Value> local_variables; // local domain keys
+struct PageState {
+    std::map<std::string, oa::runtime::Value> local_variables; // 只有无前缀 local
     std::string current_script;
     size_t current_line = 0;
     std::vector<std::pair<std::string, size_t>> call_stack; // {script, return_line}
-    // Scene (optional; saves without a snapshot restore script/Lua state
-    // only).
+    /// true = `current_script/current_line` 是**这一页的起点**（读档会重放
+    /// 这一页再停在页尾停驻）。iMel 的存档动作发生在 save.iet 里，精确位置
+    /// 已经越过页尾的 [@]；页起点是框架自己的重放入口。
+    bool page_anchor = true;
+    /// 保存发生在框架脚本（save.iet 等）时，最内层**剧情帧**压帧时正在
+    /// 执行的指令（官方 BOWS frame.current）。读档回到这一帧时先回到
+    /// `call_line`，把这一页的宏调用重走一遍再停在 `[@]`；否则直接回到
+    /// `return_line` 会立刻打印下一页。0 = 旧档/不适用。
+    size_t story_call_line = 0;
+    /// true = 位置是**这一页的脚本起点**，读档时脚本会把这一页重放一遍
+    /// （画面/文本仍由 surface 恢复）。只在存档发生在框架脚本里时使用；
+    /// 旧档没有 → false，按精确位置恢复。
+    bool page_replay = false;
+    /// 剧情页的消息窗 id（`[adv mw=...]` 的页面级配置）。框架读档后用它选
+    /// sysbtn/窗口图片目录；存档页会临时改写 `meswindow.num`，所以单独存
+    /// 页面值（不是画面快照，只是一条页面变量）。旧档没有 → 空。
+    std::string page_meswindow;
+    // 画面（场景层）
     bool has_scene = false;
     std::map<std::string, std::string> root_props;
     std::vector<LayerSnap> layers;
+    // 文本面
+    bool has_text = false;
+    std::vector<TextLayerSnap> text_layers;
     // Audio (optional).
     bool has_audio = false;
     AudioSnap audio;
-    // Message-layer text pages (optional; see TextLayerSnap).
-    bool has_text = false;
-    std::vector<TextLayerSnap> text_layers;
+};
+
+/// 引擎回顾表（`get_backlog_size` / `backlog_tags`）的一页。
+///
+/// 它不是"打开着的回顾页 UI"，而是**剧情已经读过的行**：读档后脚本的
+/// `system/backlog.iet` 靠 `e:var(system="get_backlog_size")` 和
+/// `backlog_tags(page)` 重建回顾页。不存它，读档后回顾页就是空的
+/// （用户报的"回顾页没有字"）。
+///
+/// 页锚点/画面快照**不在这里**：跳转由框架自己的载体负责（见上）。
+struct BacklogTagSnap {
+    int kind = 0; // oa::render::BacklogTag::Kind
+    std::string text;
+    std::map<std::string, std::string> font;
+    std::map<std::string, std::string> params;
+};
+struct BacklogPageSnap {
+    std::map<std::string, std::string> page_font;
+    std::vector<BacklogTagSnap> tags;
+};
+
+// --------------------------------------------------------------------------- One numbered save.
+struct SaveData : PageState {
+    int version = kSaveFormatVersion;
+    // Engine backlog (read history) + its write config. Optional; a save
+    // without it restores an empty backlog (旧档) instead of failing.
+    bool has_backlog = false;
+    bool backlog_write_mode = false;
+    bool backlog_allow = true;
+    std::vector<BacklogPageSnap> backlog;
 
     /// Encode to one binary document.
     std::string encode() const;

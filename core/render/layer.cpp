@@ -953,6 +953,42 @@ std::string Compositor::hit_test(double mx, double my, const QuadSizeFn& size,
     return hits.empty() ? std::string() : hits.front();
 }
 
+Compositor::PointerProbe Compositor::probe_pointer(double mx, double my,
+                                                   const QuadSizeFn& size, void* userdata,
+                                                   const AlphaSamplerFn& alpha) const {
+    PointerProbe probe;
+    const auto hits = hit_test_all(mx, my, size, userdata, alpha);
+    probe.hits = hits;
+    bool have_click = false;
+    bool have_roll = false;
+    for (const std::string& id : hits) { // front -> back
+        // owner：最前面的可交互层。拖拽的起点只能是它。
+        if (probe.owner.empty() && has_any_enabled_handler(id)) probe.owner = id;
+        // click / rollover：各自取"带这一行的第一层"，再按 penetration 向下扩。
+        const auto* click_row = find_event_handler(id, "click");
+        if (click_row && click_row->enabled) {
+            if (!have_click) {
+                probe.click.push_back(id);
+                have_click = true;
+            } else if (click_row->penetration) {
+                probe.click.push_back(id);
+            }
+        }
+        const auto* roll_row = find_event_handler(id, "rollover");
+        if (roll_row && roll_row->enabled) {
+            if (!have_roll) {
+                probe.rollover.push_back(id);
+                have_roll = true;
+            } else if (roll_row->penetration) {
+                probe.rollover.push_back(id);
+            }
+        }
+    }
+    std::reverse(probe.click.begin(), probe.click.end());
+    std::reverse(probe.rollover.begin(), probe.rollover.end());
+    return probe;
+}
+
 // ---------------------------------------------------------------------------
 // event registries + draggable/dragarea + clickablethreshold
 // ---------------------------------------------------------------------------
@@ -1397,8 +1433,11 @@ void Compositor::tweenset_end(uint64_t clock_ms) {
     anim_->collecting_set_ = false;
     if (anim_->set_pending_.empty()) return;
     const uint64_t set_id = anim_->next_tween_set_id_++;
-    // sequential start: each entry's start = accumulated (delay + time) of
-    // the previous entries
+    // sequential start: each entry's start = accumulated (delay + span) of
+    // the previous entries.  span 必须按**整段**算：带 yoyo/loop 的成员会
+    // 来回跑 N 个周期，只按单程 time 排下一段会让后续成员提前启动。画面
+    // 抖动就是 9 段 yoyo 之后紧跟“回到原位”的一段：提前启动后回位段先
+    // 跑完、yoyo 段再把它拖到 -size，窗口永久偏在 (-20,-17)。
     uint64_t offset = 0;
     for (const auto& pending : anim_->set_pending_) {
         uint64_t delay = 0;
@@ -1407,9 +1446,24 @@ void Compositor::tweenset_end(uint64_t clock_ms) {
         uint64_t time = 0;
         if (const auto it = pending.find("time"); it != pending.end())
             (void)parse_u64(it->second, &time);
+        uint64_t loop_delay = 0;
+        if (const auto it = pending.find("loopdelay"); it != pending.end())
+            (void)parse_u64(it->second, &loop_delay);
+        int yoyo_i = 0, loop_i = 0;
+        if (const auto it = pending.find("yoyo"); it != pending.end())
+            (void)parse_i32(it->second, &yoyo_i);
+        if (const auto it = pending.find("loop"); it != pending.end())
+            (void)parse_i32(it->second, &loop_i);
+        // 有限循环的整段时长 = N*time + (N-1)*loopdelay；无限循环没有可靠的
+        // 终点（后续成员本来也不会被排到），保守按单程推进。
+        uint64_t span = time;
+        const int cycles = yoyo_i > 0 ? yoyo_i : (loop_i > 0 ? loop_i : 0);
+        if (cycles > 0)
+            span = time * uint64_t(cycles) +
+                   (cycles > 1 ? loop_delay * uint64_t(cycles - 1) : 0);
         const uint64_t start_delay = offset + delay;
         apply_one_tween(pending, start_delay, set_id, clock_ms);
-        offset = start_delay + time;
+        offset = start_delay + span;
     }
     anim_->set_pending_.clear();
 }

@@ -403,6 +403,9 @@ const oa::render::RenderPlan* GameRuntime::current_plan() const {
     return s_->current_plan();
 }
 bool GameRuntime::save_game_to(const std::string& file) { return s_->save_game_to(file); }
+bool GameRuntime::save_file_exists(const std::string& file) const {
+    return s_->save_file_exists(file);
+}
 LoadResult GameRuntime::load_game(const std::string& file, int64_t trans_type) {
     return s_->load_game(file, trans_type);
 }
@@ -414,6 +417,9 @@ oa::runtime::CallbackResult GameRuntime::apply_event(const oa::runtime::Event& e
     return s_->dispatch_interpreter_event(e);
 }
 void GameRuntime::sound_finished(oa::media::SoundCategory cat, const std::string& id) { s_->sound_finished(cat, id); }
+std::vector<GameRuntime::SoundChannelState> GameRuntime::sound_state() const {
+    return s_->sound_state();
+}
 
 std::pair<double, double> GameRuntime::RuntimeState::bound_image_size(const oa::render::Layer& l) {
     // Cached header-sniffed natural size; Asset textures only.
@@ -784,6 +790,25 @@ oa::runtime::CallbackResult GameRuntime::RuntimeState::dispatch_interpreter_even
     if (apply_scene_event(e)) return host_event_result(e);
     if (apply_control_event(e)) return oa::runtime::CallbackResult::Continue;
 
+    // `[save]` 必须**当场**落盘：晚一拍，脚本已经走完存档页的收尾
+    // （t.saveslot=0、status、页变量都变了），存下来的变量/画面就不再是
+    // `[save]` 那一刻的东西。save 不重入解释器（onSave 只写变量），安全。
+    // `[load]` 仍走事件泵：它要清场 + 恢复位置，放在 tick 的派发段执行。
+    if (e.tag == "save") {
+        handle_save_tag(e);
+        return oa::runtime::CallbackResult::Continue;
+    }
+    // `[load]` **不返回**：原版读档是"整台机器的位置换掉"，`load.iet`/
+    // `backlog.iet` 的 `[load]` 后面紧跟的是"读档失败"的收尾代码。以前这里
+    // 只是把事件排进队列、脚本继续往下跑 —— `[load]` 之后的失败分支（会删掉
+    // `g.backlogjump_keep`、关掉 UI）先在当晚跑完，真正读档时才到，导致
+    // "跳转 = 没有跳过 start 收尾"（回顾跳转不重建消息窗）。这里返回 Pause：
+    // 脚本停在 `[load]`，事件泵在同一拍完成读档。
+    if (e.tag == "load") {
+        pending_events_.push_back(e);
+        return oa::runtime::CallbackResult::Pause;
+    }
+
     pending_events_.push_back(e);
     return host_event_result(e);
 }
@@ -876,6 +901,7 @@ void GameRuntime::RuntimeState::boot_project()
 {
     // Load system saves before boot (Lua dataloading reads g./s.).
     sysload();
+    load_read_state(); // g.readlines -> 既読表（skip 的既读判定）
     wire_lua_host();
     interpreter_->boot(rt_->project_.config.boot_script);
 }
@@ -1117,6 +1143,8 @@ void GameRuntime::RuntimeState::tick(uint64_t delta_ms, const FrameInput& in) {
     input_state_.swallowed_frame_ = false;
 
     // Lua per-frame hook first (it rewrites keys/decide edges, clears flags)
+    // 框架每帧读 s.status.*：在 Lua 的 onEnterFrame 之前把控制域状态摊平。
+    sync_control_status();
     interpreter_->fire_event("onEnterFrame");
     // decide 边沿 = 相对上一帧快照新出现的位 32（帧内/测试直接注入均
     // 生效）。配合每帧末清空覆盖（见 tick 尾部注释），FPM exclick 的
@@ -1143,44 +1171,16 @@ void GameRuntime::RuntimeState::tick(uint64_t delta_ms, const FrameInput& in) {
     update_control_skip_hold(input_state_.keys_down_);
     control_.skip_active_ = skip_active();
 
-    // Pointer chain runs before wait resolution; claimed clicks are swallowed.
-    const PointerConsumption pc = process_pointer_input(eff);
-
-    // clicked = physical left-down not consumed by layer/drag/push (and not
-    // swallowed by a hide-mode click recovery) || legacy Enter/Space role-0
-    // approximation || a keyconfig role-0 key edge.
-    bool clicked;
-    if (in.left_click_edge && !input_state_.swallowed_frame_) {
-        // 等待点击的停驻不吃 push 映射：push 是键位转发，不是 UI 命中，
-        // 不该吞掉推进剧情的那一下。Timed clickable waits ([wait input=1],
-        // eqwait) count too — the opening logo uses exactly this shape.
-        const bool click_wait = park_.wait && park_.wait->can(oa::runtime::Wait::OnClick);
-        const bool push_absorbs = pc.left_push_handled && !click_wait;
-        clicked = !pc.input_swallowed && !pc.layer_handled && !pc.drag_handled &&
-                  !push_absorbs;
-    } else {
-        clicked = input_state_.down_edges_.count(kKeyEnter) > 0 || input_state_.down_edges_.count(kKeySpace) > 0;
-    }
-    // The script's own page wait ([@]) is released by the role-0 keys. A game
-    // that names them ([keyconfig role=0]) owns that release: both games give
-    // role 0 only the dummy key 124 and fire it from their push handler when
-    // the story should go on, so a press on a menu page drawn over the story
-    // reaches the page's buttons but not the wait under it. Queue parks keep
-    // the press rules above.
-    if (advance_keys_set() && park_.wait && park_.wait->waiting_click() &&
-        park_.wait->can(oa::runtime::Wait::OnDecide) && park_.wait->script_owned)
-        clicked = false;
-    clicked = clicked || pc.role_advance;
-    // NB: only fresh PRESSES count — the host injects a mouse-left up-edge on
-    // every frame the button is not held, which would disable the guard always.
+    // Pointer chain runs before wait resolution; a claimed press never
+    // reaches the script. 一次按下的去向在 process_pointer_input 里定死
+    // （引擎门 → 层 → 脚本），这里只读结果。
+    const PressDecision press = process_pointer_input(eff);
+    const bool clicked = press.owner == PressDecision::Owner::Script;
 
     // 一次物理按下 = 一个命令。同一次按下会给出多个信号（原始按下、图层
     // 命中、游戏 setexclick 派生的 decide 边缘），它们同属一条命令，只能被
     // 消费一次。press_used_ 只延续一帧：把这次按下的 decide 余波吞掉。
-    const bool press_edge =
-        (in.left_click_edge && !input_state_.swallowed_frame_) ||
-        input_state_.down_edges_.count(kKeyEnter) > 0 ||
-        input_state_.down_edges_.count(kKeySpace) > 0;
+    const bool press_edge = press.press;
     if (press_edge) press_used_ = false;
     const bool used_before = press_used_;
     press_live_ = press_edge || (clicked && !press_used_) ||
@@ -1194,10 +1194,20 @@ void GameRuntime::RuntimeState::tick(uint64_t delta_ms, const FrameInput& in) {
     // 归一后的两条命令（补字用掉的那一按不再算）。
     const bool click_cmd = clicked && !press_used_;
     const bool decide_cmd = input_state_.decide_edge_ && !press_used_;
+    // オート中のクリックはオートを止める（[automode stopbyclick]、既定 on）。
+    // 判定は「生の押下」で行う：文字送り中の 1 発は click_cmd に昇格しない
+    // （press_used_ が補字に食う）ので、click_cmd だけ見ると止まらない。
+    // ボタン自身を押した 1 発（layer_handled）は除く —— オート開始の
+    // クリックで即停止してしまう。
+    if (press_edge && press.owner != PressDecision::Owner::Layer && automode_active() &&
+        control_.automode_stopbyclick_)
+        set_automode_mode(false);
 
     // script status 4 = forced stop (no user input): park the story line but
     // keep onEnterFrame ticking (already fired) and scene tweens advancing.
-    if (control_.script_status_ != 4) {
+    // 緊急回避中も脚本を進めない：原版の vsync_game は avoid 中に本体ループへ
+    // 入らない（回避画像の下で会話が進んでしまうのを防ぐ）。
+    if (control_.script_status_ != 4 && !control_.avoid_active_) {
         // Exskip: burn crossing parks in one bounded burst.
         const int kMaxExskipBurst = 4096;
         int burst = 0;
@@ -1228,6 +1238,10 @@ void GameRuntime::RuntimeState::tick(uint64_t delta_ms, const FrameInput& in) {
         }
     }
 
+    // 被脚本输入掩码吃掉的这一下：如果同一帧里脚本自己的等待正好被它放行
+    // （框架的 `[wait]` 之后紧跟 `var t.eventfilter=0` 是标准写法），原版在
+    // 这一下之后才派发层事件，所以按钮是“一下点得动”的。引擎把层派发放在
+    // 等待解析之前，必须在这里补一次，否则每个按钮/对话框都要点两次。
     park_.pending_custom.clear();
 
     // Overrides are frame-local: a sticky decide bit 32 would swallow every
@@ -1265,7 +1279,7 @@ void GameRuntime::RuntimeState::arm_park(oa::runtime::Wait w, bool script_owned)
         std::fprintf(stderr, "[park] arm %s:%zu (now %s:%zu) stage=%d click=%d timed=%lld own=%d w=0x%x\n",
                      w.owner_script.c_str(), w.owner_line,
                      cs ? cs->c_str() : "-", interpreter_ ? interpreter_->current_line() : 0,
-                     int(w.stage), w.can(oa::runtime::Wait::OnClick) ? 1 : 0,
+                     int(w.stage), w.has(oa::runtime::Wait::WakeClick) ? 1 : 0,
                      (long long)w.timer_ms, w.script_owned ? 1 : 0, w.wakes);
     }
     park_.wait = std::move(w);
@@ -1273,12 +1287,9 @@ void GameRuntime::RuntimeState::arm_park(oa::runtime::Wait w, bool script_owned)
 
 void GameRuntime::RuntimeState::normalize_wait(oa::runtime::Wait& w) {
     using W = oa::runtime::Wait;
-    w.wakes = 0;
+    // 不清 wakes：构造时写的就是"什么能放行这个停驻"（唯一的真值），
+    // 这里只补演出/时钟类的位。
     w.wake_id.clear();
-    if (w.can(W::OnClick)) w.wakes |= W::WakeClick;
-    if (w.can(W::OnDecide)) w.wakes |= W::WakeDecide;
-    if (w.can(W::OnSkip)) w.wakes |= W::WakeSkip;
-    if (w.can(W::OnAuto)) w.wakes |= W::WakeAuto;
     if (w.timed()) {
         w.wakes |= W::WakeTimer;
         w.deadline_ms = now_ms_ + uint64_t(w.timer_ms);
@@ -1342,7 +1353,7 @@ std::optional<oa::runtime::Wait> GameRuntime::RuntimeState::park_from_event(
             type = parse_i32(it->second, 1);
         if (type == 0) return std::nullopt;
         W w;
-        w.release = W::OnDecide | W::OnSkip;
+        w.wakes = W::WakeSkip | W::WakeDecide;
         w.stage = W::Stage::Trans;
         w.stage_id = "trans";
         return w;
@@ -1350,7 +1361,7 @@ std::optional<oa::runtime::Wait> GameRuntime::RuntimeState::park_from_event(
     if (ev->kind == K::LayerEventCmd) {
         if (ev->tag == "video" && ev->id.empty()) {
             W w;
-            w.release = W::OnDecide | W::OnSkip;
+            w.wakes = W::WakeSkip | W::WakeDecide;
             w.stage = W::Stage::Video;
             return w;
         }
@@ -1360,7 +1371,7 @@ std::optional<oa::runtime::Wait> GameRuntime::RuntimeState::park_from_event(
                 sync = parse_i32(it->second, 0);
             if (sync != 0 && !scene().tweenset_collecting()) {
                 W w;
-                w.release = W::OnDecide | W::OnSkip;
+                w.wakes = W::WakeSkip | W::WakeDecide;
                 w.stage = W::Stage::Tween;
                 w.stage_id = ev->id;
                 return w;
@@ -1368,7 +1379,7 @@ std::optional<oa::runtime::Wait> GameRuntime::RuntimeState::park_from_event(
         }
         if (ev->tag == "/tweenset" && !park_.pending_sync_tweens.empty()) {
             W w;
-            w.release = W::OnDecide | W::OnSkip;
+            w.wakes = W::WakeSkip | W::WakeDecide;
             w.stage = W::Stage::Tween;
             w.tween_ids = std::move(park_.pending_sync_tweens);
             park_.pending_sync_tweens.clear();
@@ -1382,7 +1393,7 @@ std::optional<oa::runtime::Wait> GameRuntime::RuntimeState::park_from_event(
             time = parse_i32(it->second, 0);
         if (time > 0) {
             W w;
-            w.release = W::OnSkip;
+            w.wakes = W::WakeSkip;
             w.stage = W::Stage::AllDelete;
             w.stage_id = "alldelete";
             return w;
@@ -1397,7 +1408,7 @@ namespace {
 bool is_bare_stop(const oa::runtime::Wait& w) {
     return w.stage == oa::runtime::Wait::Stage::None && !w.timed() && w.keys.empty() &&
            !w.on_reveal_done && !w.reveal_clear && !w.waiting_click() &&
-           !w.can(oa::runtime::Wait::OnClick);
+           !w.has(oa::runtime::Wait::WakeClick);
 }
 } // namespace
 
@@ -1463,10 +1474,37 @@ void GameRuntime::RuntimeState::drain_parked_queue() {
             // parks + queue tail). Nothing in this drain may run behind it.
             return;
         }
-        const bool moved = script_before != interpreter_->current_script() ||
+        // 队列里的 [jump]/[call] 是**显式改位置**：即便落点和停驻记录的
+        // 行号相同（停驻记的是"停住后"的下一行，同脚本内的 label 可能正好
+        // 是同一行），旧停驻也已经失效。只比较行号会把这种情况当成"没动"，
+        // 于是脚本位置已经跳到 label、旧停驻却还挡在前面 —— 玩家必须再点
+        // 一次才继续（test10 的按钮/对话框"点两次"）。
+        const bool explicit_move =
+            interpreter_->queued_saw_jump() || interpreter_->queued_saw_call();
+        const bool moved = explicit_move ||
+                           script_before != interpreter_->current_script() ||
                            line_before != interpreter_->current_line() ||
                            stack_before != interpreter_->call_stack().size();
         if (r == oa::runtime::ExecutionResult::Wait) {
+            // 队列里的 [stop] 是框架的"防穿透"余量（stop 过滤器在停住之后又
+            // 排了一条）。它跟着同一个队列里的 [jump]/[call] 一起被排空时，
+            // 属于**旧位置**：不能再把已经跳过去的新位置停住。否则脚本位置
+            // 已经是 label、停驻却还在原处 —— 玩家得再点一次才动
+            // （test10 的按钮/对话框"点两次"就是这么来的）。
+            const auto* ev = interpreter_->last_wait_event();
+            const bool stop_like =
+                ev && ev->kind == oa::runtime::Event::Kind::Wait_ &&
+                ev->wait.stage == oa::runtime::Wait::Stage::None &&
+                ev->wait.timer_ms < 0 && ev->wait.keys.empty() &&
+                !ev->wait.on_reveal_done && !ev->wait.reveal_clear;
+            if (explicit_move && interpreter_->last_wait_from_queue() && stop_like) {
+                park_.wait.reset();
+                // 旧位置的尾巴属于被放弃的流程（框架的重复 [stop] 也在里
+                // 面）；补到新位置前面只会把它再停住。
+                park_.tail.clear();
+                clear_pending_parks();
+                return;
+            }
             if (auto park = park_from_event(interpreter_->last_wait_event())) {
                 // 只有"队里那条 tag 自己"的停驻才是队列停驻。排空过程里被
                 // [call] 带进去的脚本行（UI 的 [stop]）仍属于脚本：释放时要
@@ -1503,10 +1541,13 @@ void GameRuntime::RuntimeState::drain_parked_queue() {
             return; // the running park still governs
         }
         if (moved) {
-            // A queued jump/return changed position: the UI flow takes over;
-            // the dropped park's script tail still owes its cleanup tags.
+            // A queued jump/return changed position: the UI flow takes over.
+            // 显式 [jump]/[call] 是"换流程"：旧停驻的尾巴属于被放弃的位置
+            // （框架 stop 过滤器排下的重复 [stop] 就在这里），不能补到新
+            // 位置前面。只有 return 这类"回到原流程"的移动才需要把尾巴
+            // 还回去。
             park_.wait.reset();
-            interpreter_->prepend_tags(std::move(park_.tail));
+            if (!explicit_move) interpreter_->prepend_tags(std::move(park_.tail));
             park_.tail.clear();
             clear_pending_parks();
             park_.pending_custom.clear();
@@ -1549,6 +1590,15 @@ void GameRuntime::RuntimeState::dispatch_control_events() {
     std::deque<oa::runtime::Event> keep;
     for (const auto& e : pending_events_) {
         if (e.kind == oa::runtime::Event::Kind::Exit) {
+            // 原版引擎在 [exit] 时**自动写全局档**（BOWG/BOWX），这是 g./s. 域
+            // 唯一的常规持久化点：游戏脚本自己把 `[save]`（无 file）散落在
+            // 菜单里，但"选完语言 → 标题 → 退出"这条路径一次都不经过它们。
+            // test10 的 macro.iet 把这件事写成了注释：
+            //   「[exit]命令でグローバルセーブが自動で走るので対策する」
+            // （*共通終了処理，紧挨着 [exit]）。少了这一步，g.language /
+            // g.clear_flag / g.readlines 都不会落盘，第二次启动就回到语言页、
+            // 标题也永远停在未通关分支。
+            (void)syssave();
             // Host quit request; hosts only poll exit_requested.
             std::fprintf(stderr, "[runtime] exit requested\n");
             exit_requested_ = true;
@@ -1585,6 +1635,18 @@ void GameRuntime::RuntimeState::ensure_active_message_node() {
     // 文本宿主就是这一层自己（消息 id == 节点 id）。layered 只决定
     // "文本是否跟着宿主树的显隐走"，不再有槽位/绑定表。
     scene().ensure_message_scene_node(active, al->layered);
+    // 字体表没给 width 时，用节点自身的逻辑框宽兜底折行（消息窗节点的
+    // width/clip 来自窗口纹理，内边距已由宿主扣除）。节点只绑了纹理、没有
+    // 逻辑宽时再退到纹理宽（仍未扣边距，但比 1e18 永不折行正确）。
+    if (const oa::render::Layer* node = scene().find(active)) {
+        double bw = node->has_clip && node->clip_w > 0.0 ? node->clip_w : node->width;
+        if (!(bw > 0.0) && oa::render::textured_content(*node)) {
+            const auto& sizes = static_cast<const oa::render::ContentSizeSource&>(renderer_);
+            if (const auto sz = sizes.decoded_size(oa::render::content_texture_key(*node)))
+                bw = sz->first;
+        }
+        if (bw > 0.0) text().set_message_box_width(active, bw);
+    }
 }
 
 bool GameRuntime::RuntimeState::apply_text_event(const oa::runtime::Event& e) {
@@ -1596,25 +1658,42 @@ bool GameRuntime::RuntimeState::apply_text_event(const oa::runtime::Event& e) {
     switch (e.kind) {
         case K::ScenarioLine: {
             renderer_.note(RNote::Text);
+            const auto* prev = text().layer(text().active_layer_id());
+            const bool new_page = !prev || prev->char_count == 0;
             text().push_text(e.content);
             // every drawable message layer owns a scene node — content
             // pushed before any chgmsg (default/active layer) materializes it
             // lazily, so glyphs have exactly one paint point (their node's
             // slot) and no scene-wide text fallback pass is needed.
             ensure_active_message_node();
+            if (new_page && !e.content.empty() && interpreter_) {
+                const std::string active = text().active_layer_id();
+                const bool ui_text = active.rfind("101.sblock", 0) == 0 ||
+                                     active.rfind("100.", 0) == 0 ||
+                                     active.rfind("1000.", 0) == 0;
+                const std::string* cs = interpreter_->current_script();
+                bool story_frame = cs && !oa::runtime::is_framework_script(*cs);
+                for (const auto& f : interpreter_->call_stack())
+                    if (!f.script.empty() && !oa::runtime::is_framework_script(f.script))
+                        story_frame = true;
+                if (story_frame && !ui_text) interpreter_->note_page_printed(active);
+            }
             return true;
         }
         case K::LineBreak: {
             // [rt]：omitblankline=1（缺省 true）时末行为空行则不另起
             const std::string ob = par("omitblankline");
             const bool omit = ob.empty() || parse_i32(ob, 1) != 0;
-            text().line_break(omit);
+            text().line_break(omit, e.params);
             return true;
         }
         case K::PageBreak: {
             std::optional<int> bl;
             const std::string bp = par("backlog");
             if (!bp.empty()) bl = parse_i32(bp, 0);
+            // 回顾表的一页 = 这一页的**重放命令**（print/font/rt…）。
+            // 跳转时框架用它自己的载体（backlog_N.dat / log.stack / blj）
+            // 重新打印，引擎不在这里存画面。
             text().page_break(bl);
             return true;
         }
@@ -2098,7 +2177,7 @@ void GameRuntime::RuntimeState::transition_begin(const std::map<std::string, std
 }
 
 bool GameRuntime::RuntimeState::waiting_stop() const {
-    return park_.wait && !park_.wait->can(oa::runtime::Wait::OnClick);
+    return park_.wait && !park_.wait->has(oa::runtime::Wait::WakeClick);
 }
 
 // Debug-skip fast-forward: non-Stop waits release instantly; the
@@ -2249,6 +2328,8 @@ bool GameRuntime::RuntimeState::fire_click(oa::runtime::Wait& w, bool from_decid
 
 bool GameRuntime::RuntimeState::resolve_wait(uint64_t delta_ms, bool click_cmd,
                                              bool decide_cmd) {
+    // 緊急回避中は物語を進めない（原版も vsync が本体ループに入らない）。
+    if (control_.avoid_active_) return false;
     if (!park_.wait) return true;
     oa::runtime::Wait& w = *park_.wait;
     using W = oa::runtime::Wait;
@@ -2271,7 +2352,7 @@ bool GameRuntime::RuntimeState::resolve_wait(uint64_t delta_ms, bool click_cmd,
     if (skipping && w.has(W::WakeSkip)) {
         const bool page_click =
             w.stage == W::Stage::None && !w.timed() && w.keys.empty() &&
-            !w.on_reveal_done && !w.reveal_clear && w.can(W::OnClick);
+            !w.on_reveal_done && !w.reveal_clear && w.has(W::WakeClick);
         // The "complete the page, advance on the next tick" rule exists so one
         // human press is not spent on two commands. A forced fast-forward has
         // no press to conserve: completing the reveal and releasing the page in
@@ -2371,6 +2452,17 @@ void GameRuntime::RuntimeState::advance_wait() {
     const bool page_wait_release = park_.wait && park_.wait->waiting_click();
     const bool script_owned = park_.wait && park_.wait->script_owned;
     const bool has_pending = !park_.pending.empty();
+    // 停驻只在它武装的那一行有效（同 pop_park_context / Wait::owner_*）。
+    // 点击先派发给层，层里的 [jump]/[call] 可能已经把脚本挪到别的流程
+    // （backlog 的「戻る」按钮：leave 的 [returns] 已经把位置交还给
+    // menu.iet 的 `[jump leave]`）。这时再 +1 会把落点的第一条指令跳过，
+    // UI 收尾于是接着往下跑进别的分支。同一帧新武装的停驻也不吃这一下：
+    // 那一次按下的所有权已经属于刚关闭的 UI。
+    const bool on_owner_line =
+        park_.wait && interpreter_->current_script() &&
+        park_.wait->owner_script == *interpreter_->current_script() &&
+        park_.wait->owner_line == interpreter_->current_line();
+    const bool armed_now = park_.wait && park_.wait->armed_tick == tick_count_;
     park_.wait.reset();
     if (page_wait_release) text().anchor_active_to_content();
     // 这一层是脚本自己的停驻 → 光标 +1；队列停驻（`script_owned=false`）的
@@ -2382,7 +2474,7 @@ void GameRuntime::RuntimeState::advance_wait() {
     // 队尾的那个 uitrans 待定停驻花掉、剧情行不动，表现就是"文字没有刷新"
     // （NekoMiko 进设置再回来：点多少下都停在同一行）。
     // 先 +1 再让待定停驻接管是安全的：脚本仍被那个停驻挡住，下一行不会提前跑。
-    interpreter_->release_park(script_owned);
+    interpreter_->release_park(script_owned && on_owner_line && !armed_now);
     // The held script tail belongs after this wait: run it before any tag that
     // arrived while the park was live.
     prepend_live_tail();
@@ -2443,66 +2535,58 @@ bool key_has_drag_handler(const oa::render::Compositor& scene, const std::string
 }
 } // namespace
 
-GameRuntime::RuntimeState::PointerConsumption GameRuntime::RuntimeState::process_pointer_input(const FrameInput& in) {
-    PointerConsumption pc;
-    if (!interpreter_) return pc;
-    // 脚本已经用 `e:overrideKey{status=0}` 吞掉本帧输入（vsync 的 btstop /
-    // 按键检查 / UI 打开）：这一帧不命中、不 hover、不派发。
-    if (input_state_.swallowed_frame_) return pc;
-    const double mx = double(in.mouse_x);
-    const double my = double(in.mouse_y);
+GameRuntime::RuntimeState::PressDecision GameRuntime::RuntimeState::process_pointer_input(
+    const FrameInput& in) {
+    PressDecision d;
+    if (!interpreter_) return d;
+
     const bool left_down_edge = in.left_click_edge;
     const bool left_up_edge = pointer_.left_down_prev_ && !in.left_down;
     pointer_.left_down_prev_ = in.left_down;
+    const bool enter_space = input_state_.down_edges_.count(kKeyEnter) > 0 ||
+                             input_state_.down_edges_.count(kKeySpace) > 0;
+    // 一次物理按下 = 一张只能被认领一次的票。
+    d.press = left_down_edge || enter_space;
+
+    // 脚本用 `e:overrideKey{status=0}` 吞掉本帧输入（vsync 的 btstop /
+    // 按键检查 / UI 打开）。左键谁都不给；Enter/Space 仍算一次"决定"
+    // （原版如此：overrideKey 关的是指针，不是键盘）。
+    if (input_state_.swallowed_frame_) {
+        if (left_down_edge) d.owner = PressDecision::Owner::Engine;
+        else if (enter_space) d.owner = PressDecision::Owner::Script;
+        return d;
+    }
+
+    const double mx = double(in.mouse_x);
+    const double my = double(in.mouse_y);
     const bool pointer_moved =
         !pointer_.mouse_inited_ || in.mouse_x != pointer_.mouse_prev_x_ || in.mouse_y != pointer_.mouse_prev_y_;
     pointer_.mouse_inited_ = true;
     pointer_.mouse_prev_x_ = in.mouse_x;
     pointer_.mouse_prev_y_ = in.mouse_y;
 
+    // 緊急回避（スクランブル）中はポインタを一切当てない。画像が全画面を
+    // 覆っているので hover/click の行き先は無い。終了キー（role 16）だけは
+    // 键位处理に渡す。
+    if (control_.avoid_active_) {
+        d.owner = PressDecision::Owner::Engine;
+        (void)dispatch_key_edges();
+        return d;
+    }
+
     // hide mode: a left click first recovers the message window and is
     // swallowed for the rest of the frame (hide click recovery, no
     // click/advance chain).
     if (control_.hide_active_ && left_down_edge) {
         exit_hide_mode();
-        pc.input_swallowed = true;
-        return pc;
+        d.owner = PressDecision::Owner::Engine;
+        return d;
     }
 
-    // --- hit test (geometry + clickablethreshold alpha) --------------------
-    const auto hits = scene().hit_test_all(mx, my, pointer_.hit_size_, pointer_.compositor_userdata_,pointer_.alpha_sampler_);
-    // layers that can receive events at all = hit-test interaction gate
-    // (applied here at dispatch)
-    std::vector<std::string> interactive;
-    for (const std::string& id : hits)
-        if (scene().has_any_enabled_handler(id)) interactive.push_back(id);
-
-    // event_dispatch_layers: top + penetration, reversed.
-    //
-    // "顶层"取**带有这个事件处理行的第一层**，不是命中列表的第一层。
-    // 反例（test13）：存档/读档界面的槽位上盖着一层 alpha=0 的拖拽缩略图
-    // `500.99.N`（只有 drag/dragout），按钮本体 `500.10.N.0` 才有
-    // rollover/click。按命中列表取第一层的话，按钮的 rollover / click 全被
-    // 这层挡掉（它没声明 penetration），于是 `btn_cursor` 恒为 nil —— 槽位
-    // 既不高亮也点不动，读档界面点哪个槽都没反应（"没法读档"）。
-    // 没有该事件处理行的层本来就不参与这个事件的派发，不该占"顶层"的名额。
-    auto dispatch_list = [&](const std::vector<std::string>& base,
-                             const std::string& event_type) -> std::vector<std::string> {
-        std::vector<std::string> out;
-        bool have_top = false;
-        for (const std::string& id : base) {
-            const auto* h = scene().find_event_handler(id, event_type);
-            if (!h || !h->enabled) continue;
-            if (!have_top) {
-                out.push_back(id);
-                have_top = true;
-            } else if (h->penetration) {
-                out.push_back(id);
-            }
-        }
-        std::reverse(out.begin(), out.end());
-        return out;
-    };
+    // 一次命中扫描，三个消费者共用：owner（拖拽锚点）、click 链、hover 链。
+    const auto probe = scene().probe_pointer(mx, my, pointer_.hit_size_,
+                                             pointer_.compositor_userdata_,
+                                             pointer_.alpha_sampler_);
 
     // --- hover：按**层实例**记账，不按 id -------------------------------
     //
@@ -2512,10 +2596,9 @@ GameRuntime::RuntimeState::PointerConsumption GameRuntime::RuntimeState::process
     // 就是"有时有反应、有时没反应"。带上实例代号，重建 = 新对象 = 该重新
     // 进一次。
     if (pointer_moved) {
-        const auto hover_list = dispatch_list(interactive, "rollover");
         std::map<std::string, uint32_t> next;
         // (a) 仍在指针下的层：代号没变才算留任，否则按"新层"重发 over
-        for (const std::string& id : hover_list) { // bottom -> top
+        for (const std::string& id : probe.rollover) { // bottom -> top
             const uint32_t gen = scene().generation_of(id);
             const auto it = pointer_.hovered_.find(id);
             if (it != pointer_.hovered_.end() && it->second == gen) {
@@ -2542,7 +2625,7 @@ GameRuntime::RuntimeState::PointerConsumption GameRuntime::RuntimeState::process
         for (const auto& [id, gen] : pointer_.hovered_) {
             if (next.count(id)) continue;
             const bool still_under_pointer =
-                std::find(hits.begin(), hits.end(), id) != hits.end();
+                std::find(probe.hits.begin(), probe.hits.end(), id) != probe.hits.end();
             const auto* row = scene().find_event_handler(id, "rollover");
             if (still_under_pointer && row && row->enabled &&
                 scene().generation_of(id) == gen) {
@@ -2572,32 +2655,95 @@ GameRuntime::RuntimeState::PointerConsumption GameRuntime::RuntimeState::process
             }
         }
     }
-    // --- click + drag start  ------------------------------
+
+    // --- 按下：拖拽 → 点击 -------------------------------------------
     //
+    // 拖拽只认 owner（指针下最前面的可交互层）。不能改成"最前面的 drag
+    // 层"：旧框架的列表页把 jump 按钮画在全屏拖拽层 500.0.drag 之上，
+    // 那样选会永远先起拖拽、按钮一次都点不到（backlog 跳转没反应）。
     if (left_down_edge) {
-        const std::string top_hover = interactive.empty() ? std::string() : interactive.front();
-        if (!top_hover.empty() && scene().is_layer_draggable(top_hover) &&
-            key_has_drag_handler(scene(), top_hover)) {
-            pc.drag_handled = drag_begin(top_hover, false);
-            if (pc.drag_handled) {
+        // 背景「推しエフェクト」这类**全屏拖拽范围层**（push_ef 的 `-1000`：
+        // 画面最背面、透明、只有 drag 行）会挡在剧情点击停驻前面。它只负责
+        // 手势演出，不是按钮：没有可点的行、当前又是剧情点击停驻时，这一下
+        // 必须仍然归脚本（翻页），不能因为起了拖拽就把按下票吞掉。停在上层
+        // 的按钮/槽位拖动不受影响（probe.click 非空）。
+        //
+        // 判据是**它是不是压在画面最底下**（hits 是前→后，back 最深），不是
+        // "没有 click 行"。消息窗顶上的触摸条（`1.80.mw.zmask`）同样只有
+        // drag 行、同样停在剧情点击停驻上，但它在一堆层的前面 —— 早先用
+        // "没有 click 行"当判据，把触摸条也当成氛围层，拖拽整条失效。
+        const bool owner_is_backmost =
+            !probe.hits.empty() && probe.hits.back() == probe.owner;
+        const bool ambient_drag = probe.click.empty() && owner_is_backmost && park_.wait &&
+                                  park_.wait->waiting_click();
+        if (std::getenv("OA_DRAGDBG")) {
+            std::fprintf(stderr,
+                         "[dragdbg] at (%.0f,%.0f) owner='%s' backmost=%d ambient=%d "
+                         "draggable=%d dragrow=%d hits=%zu\n",
+                         mx, my, probe.owner.c_str(), int(owner_is_backmost), int(ambient_drag),
+                         probe.owner.empty() ? 0 : int(scene().is_layer_draggable(probe.owner)),
+                         probe.owner.empty() ? 0 : int(key_has_drag_handler(scene(), probe.owner)),
+                         probe.hits.size());
+            std::fprintf(stderr, "[dragdbg]   hits:");
+            for (size_t i = 0; i < probe.hits.size() && i < 8; ++i)
+                std::fprintf(stderr, " %s", probe.hits[i].c_str());
+            std::fprintf(stderr, "\n");
+        }
+        if (!ambient_drag && !probe.owner.empty() && scene().is_layer_draggable(probe.owner) &&
+            key_has_drag_handler(scene(), probe.owner)) {
+            if (drag_begin(probe.owner, false)) {
+                d.owner = PressDecision::Owner::Layer;
+                d.layer = probe.owner;
                 // 按下这一拍就要派发一次 `drag`（位移 0）。原版在"开始拖动"
                 // 的当拍就进 drag 回调：读档界面的槽位缩略图靠这一拍把
                 // `adv.fakeclick` 立起来，松手时 vsync 的 `isUpTap()` 才能用
                 // `e:overrideKey{key=146}` 合成"确定"，走到 `save_click` →
                 // `save_check`。只在移动时派发的话，原地点击永远不触发
                 // 槽位的 drag 回调，点哪个槽都没反应（test13 读档）。
-                if (const auto* row = scene().find_event_handler(top_hover, "drag"))
-                    dispatch_layer_row(top_hover, *row, "drag",
-                                       {{"drag", "1"}, {"id", top_hover}},
+                if (const auto* row = scene().find_event_handler(probe.owner, "drag"))
+                    dispatch_layer_row(probe.owner, *row, "drag",
+                                       {{"drag", "1"}, {"id", probe.owner}},
                                        PointerDispatch::Kind::DragMove);
             }
         }
-        if (!pc.drag_handled) {
-            for (const std::string& id : dispatch_list(interactive, "click")) {
+        if (d.owner != PressDecision::Owner::Layer) {
+            if (std::getenv("OA_INPUTDBG")) {
+                std::fprintf(stderr, "[hit] click chain:");
+                for (const std::string& cid : probe.click) {
+                    const auto* r = scene().find_event_handler(cid, "click");
+                    std::fprintf(stderr, " %s(row=%d,label=%s)", cid.c_str(), r ? 1 : 0,
+                                 r ? r->label.c_str() : "");
+                }
+                std::fprintf(stderr, "\n");
+            }
+            // probe.click 是**从下往上**（probe_pointer 里 reverse 过，hover
+            // 链要的就是这个顺序）。点击必须从最上层往下：盖在页面上的对话
+            // 框按钮才是玩家点的那个 —— 先派发下层的话，下层按钮会把
+            // `t.button_data` 这类共享槽写成自己的值，上层的 [call pushed]
+            // 于是跳到下层按钮的标签（点"确定"却重开对话框）。
+            for (auto cit = probe.click.rbegin(); cit != probe.click.rend(); ++cit) {
+                const std::string& id = *cit;
                 const auto* row = scene().find_event_handler(id, "click");
                 if (!row) continue;
-                pc.layer_handled |= dispatch_layer_row(
-                    id, *row, "click", {{"click", "1"}}, PointerDispatch::Kind::Click);
+                // NotHandled 才继续往下传。Masked（脚本掩码）同样算认领：
+                // 掩码是"别执行这个按钮"，不是"把这一下让给剧情翻页"。
+                if (dispatch_layer_row(id, *row, "click", {{"click", "1"}},
+                                       PointerDispatch::Kind::Click) !=
+                    HandlerOutcome::NotHandled) {
+                    d.owner = PressDecision::Owner::Layer;
+                    d.layer = id;
+                    // 带跳转的按钮 = 这一下点击的终点。
+                    //
+                    // 框架里每个按钮的 click 行都写 penetration=1，命中扫描
+                    // 会把**压在它下面的**按钮也算进来（对话确认框盖在语言
+                    // 按钮上时，点"确定"会连底下那个语言按钮一起派发）。
+                    // 这些行用的是同一个全局槽（`handler="var" name="t.button_data"`），
+                    // 两条 [call pushed] 排进队列后都读到**最后一个**值 ——
+                    // 点确定反而跳到上一个按钮的标签（对话框反复重开、语言
+                    // 永远选不上）。原版是逐个立即执行，天然不会串。这里让
+                    // "会改变流程的按钮"独占这一次按下，纯视觉/悬停层不受影响。
+                    if (row->call || !row->label.empty() || !row->file.empty()) break;
+                }
             }
         }
     }
@@ -2605,23 +2751,55 @@ GameRuntime::RuntimeState::PointerConsumption GameRuntime::RuntimeState::process
         // 目标层被重建/删除 ⇒ 这条拖拽到此为止（不再把 drag 送进旧回调）。
         if (scene().generation_of(pointer_.drag_layer_) != pointer_.drag_generation_) {
             pointer_.drag_layer_.clear();
-            pc.drag_handled = true;
+            d.owner = PressDecision::Owner::Layer;
         } else {
             drag_update(mx, my);
-            pc.drag_handled = true;
+            d.owner = PressDecision::Owner::Layer;
         }
     }
-    if (left_up_edge) {
-        if (!pointer_.drag_layer_.empty()) {
-            if (scene().generation_of(pointer_.drag_layer_) == pointer_.drag_generation_)
-                drag_end();
-            else
-                pointer_.drag_layer_.clear();
-            pc.drag_handled = true;
-        }
+    if (left_up_edge && !pointer_.drag_layer_.empty()) {
+        if (scene().generation_of(pointer_.drag_layer_) == pointer_.drag_generation_)
+            drag_end();
+        else
+            pointer_.drag_layer_.clear();
+        d.owner = PressDecision::Owner::Layer;
     }
 
-    // --- global push handlers for every key-down edge  ----
+    // 键位侧只报告认领，不抢按下的所有权。
+    const KeyEdgeClaims keys = dispatch_key_edges();
+    if (d.owner == PressDecision::Owner::None) {
+        if (keys.role_page) {
+            d.owner = PressDecision::Owner::Script;
+        } else if (d.press) {
+            // 全局 push 行接了左键，且当前不是"点击停驻"：push 是键位转发，
+            // 不是 UI 命中，不该顺带翻页（评论里那个开屏 logo 的形状）。
+            const bool click_wait = park_.wait && park_.wait->has(oa::runtime::Wait::WakeClick);
+            const bool push_absorbs = keys.left_push && !click_wait;
+            // 游戏自己命名了 role-0（advance_keys_set）：脚本自有的点击
+            // 停驻由游戏释放（菜单页盖在剧情上时，按到按钮不该翻页）。
+            const bool game_owns = advance_keys_set() && park_.wait &&
+                                   park_.wait->waiting_click() &&
+                                   park_.wait->has(oa::runtime::Wait::WakeDecide) &&
+                                   park_.wait->script_owned;
+            if (!push_absorbs && !game_owns) d.owner = PressDecision::Owner::Script;
+        }
+    }
+    if (std::getenv("OA_INPUTDBG") && (d.press || d.owner != PressDecision::Owner::None)) {
+        const char* owner = d.owner == PressDecision::Owner::Engine   ? "Engine"
+                            : d.owner == PressDecision::Owner::Layer  ? "Layer"
+                            : d.owner == PressDecision::Owner::Script ? "Script"
+                                                                      : "None";
+        const auto mask = interpreter_->variables().get("t.eventfilter");
+        std::fprintf(stderr, "[press] owner=%s layer=%s press=%d mask=%s left=%d\n", owner,
+                     d.layer.c_str(), int(d.press),
+                     mask ? mask->to_display().c_str() : "<unset>", int(left_down_edge));
+    }
+    return d;
+}
+
+
+GameRuntime::RuntimeState::KeyEdgeClaims GameRuntime::RuntimeState::dispatch_key_edges() {
+    KeyEdgeClaims claims;
     std::vector<int> key_edges(input_state_.down_edges_.begin(), input_state_.down_edges_.end());
     std::sort(key_edges.begin(), key_edges.end());
     for (const int key : key_edges) {
@@ -2636,26 +2814,22 @@ GameRuntime::RuntimeState::PointerConsumption GameRuntime::RuntimeState::process
                           interpreter_->last_wait_from_queue();
         }
         // keyconfig role edges (advance/hide/backlog/automode/skip).
-        // Role-0 edges count as a
-        // click substitute (pc.role_advance feeds the clicked formula).
-        if (handle_role_key_edge(key)) pc.role_advance = true;
+        if (handle_role_key_edge(key)) claims.role_page = true;
         const std::string key_string = std::to_string(key);
         const auto* row = scene().get_input_handler("push", key_string);
         if (!row) {
-            // No push row (project registers no key handler for this key):
-            // the cancel press still has to release the exkey park.
-            if (cancel_park) pc.role_advance = true;
+            if (cancel_park) claims.role_page = true;
             continue;
         }
         const std::string event_type = is_mouse_button_key(key) ? "click" : "key";
         const bool handled = dispatch_input_row(
             "setonpush", *row,
             {{"key", key_string}, {"type", event_type}}, PointerDispatch::Kind::Push);
-        if (key == kKeyMouseLeft && handled) pc.left_push_handled = true;
+        if (key == kKeyMouseLeft && handled) claims.left_push = true;
         // Cancel press also runs the push row so flg.keycode is recorded.
-        if (cancel_park) pc.role_advance = true;
+        if (cancel_park) claims.role_page = true;
     }
-    return pc;
+    return claims;
 }
 
 void GameRuntime::RuntimeState::notify_pointer(const PointerDispatch& d) {
@@ -2664,17 +2838,23 @@ void GameRuntime::RuntimeState::notify_pointer(const PointerDispatch& d) {
     if (pointer_.pointer_observer_) pointer_.pointer_observer_(d);
 }
 
-bool GameRuntime::RuntimeState::dispatch_layer_row(
+GameRuntime::RuntimeState::HandlerOutcome GameRuntime::RuntimeState::dispatch_layer_row(
     const std::string& id, oa::render::LayerEventHandler row,
     const std::string& event_type,
     const std::vector<std::pair<std::string, std::string>>& runtime_params,
     PointerDispatch::Kind kind) {
     (void)event_type;
-    if (!row.enabled) return false;
+    if (!row.enabled) return HandlerOutcome::NotHandled;
     // e:setEventFilter consult: 1 = script claims it, 2 = pretend failure.
     const auto verdict = interpreter_->lua_bridge().run_event_filter("lyevent", row.filter_params);
-    if (verdict == 2) return false;
-    if (verdict == 1) return true; // handled by the script, nothing to run
+    if (verdict == 2) return HandlerOutcome::NotHandled;
+    if (verdict == 1) {
+        // 脚本的 lyevent 过滤器只是想屏蔽**这一层**的动作（框架的输入掩码）。
+        // 它不吞玩家这一下点击本身：调用方会把这次按下继续传给停驻解析，
+        // 原版就是"先跑脚本、再派发层"。返回 Masked 而不是 Handled，就是
+        // 为了让"这一下算按过了"这件事对上层可见。
+        return HandlerOutcome::Masked;
+    }
     // calllua-equivalent: fn = params["function"]; missing = silent no-op
     // (the [calllua] branch lives in runtime_iet.cpp).
     std::map<std::string, std::string> params = row.params;
@@ -2687,6 +2867,19 @@ bool GameRuntime::RuntimeState::dispatch_layer_row(
     // in_handler_frame() 已是 false，下面的收尾自然空转。
     const bool session = fn_it != params.end() && !fn_it->second.empty() &&
                          interpreter_->begin_handler_frame();
+    // handler="exec": the row carries an exec command. The framework's
+    // [forcedexec] macro parks `command`/`mode` on a zero-duration tween
+    // because an exec issued from a handler event cannot cancel automode
+    // (Artemis runs it inside the handler's event level); the tween fires the
+    // row at frame level instead. Same command path as [exec].
+    if (row.handler == "exec") {
+        apply_exec_command(params);
+        PointerDispatch d;
+        d.kind = kind;
+        d.layer = id;
+        d.function = "exec";
+        notify_pointer(d);
+    }
     // handler="var": apply the row's [var name data] assignment (iMel buttons).
     if (row.handler == "var") {
         const auto name_it = params.find("name");
@@ -2732,7 +2925,7 @@ bool GameRuntime::RuntimeState::dispatch_layer_row(
     }
     // 处理帧的生命周期：处理函数没排队任何 tag = 这一帧已经结束，立即回收；
     // 排了 tag 就留着，等队列排空时由 settle 收尾（[return] 也可能自己弹掉它）。
-    return handled;
+    return handled ? HandlerOutcome::Handled : HandlerOutcome::NotHandled;
 }
 
 bool GameRuntime::RuntimeState::dispatch_input_row(
@@ -2914,6 +3107,11 @@ constexpr int kRoleAutomodeOut = 10;
 constexpr int kRoleSkipIn = 12;
 constexpr int kRoleSkipOut = 13;
 constexpr int kRoleControlSkip = 14;
+/// 緊急回避（スクランブル）：role 15 = 開始、role 16 = 終了。
+/// 原版は 15/16 を鍵の役割として登録し、[avoid file=...] の画像を最前面に
+/// 出して音を止める。test13 の set_scramble() がこの2つを [keyconfig] で書く。
+constexpr int kRoleAvoidIn = 15;
+constexpr int kRoleAvoidOut = 16;
 
 } // namespace
 
@@ -2961,6 +3159,16 @@ bool GameRuntime::RuntimeState::key_is_toggle(int key, int other_role) const {
 
 /// Role edge; true when the key acted as role-0 advance.
 bool GameRuntime::RuntimeState::handle_role_key_edge(int key) {
+    // 緊急回避中は「終了キー」だけを受け付ける。物語のクリック待ちは
+    // 進めない（原版の vsync_game も avoid 中は本体ループに入らない）。
+    if (control_.avoid_active_) {
+        if (has_role(kRoleAvoidOut, key)) end_avoid();
+        return false;
+    }
+    if (has_role(kRoleAvoidIn, key) && !control_.avoid_file_.empty()) {
+        start_avoid();
+        return false;
+    }
     if (has_role(kRoleAdvance, key)) return true;
     if (has_role(kRoleHideIn, key)) {
         toggle_hide_mode();
@@ -2971,6 +3179,10 @@ bool GameRuntime::RuntimeState::handle_role_key_edge(int key) {
     } else if (has_role(kRoleBacklogOut, key)) {
         dispatch_mode_input("backlogout");
     } else if (has_role(kRoleAutomodeIn, key)) {
+        // allow=0 は「プレイヤーのキーで入れない」。スクリプトの
+        // [exec command="automode"] は set_automode_mode を直接呼ぶので
+        // ここを通らない（フレームワークは allow=0 を書いてから exec する）。
+        if (!control_.automode_allowed_) return false;
         if (key_is_toggle(key, kRoleAutomodeOut)) {
             set_automode_mode(!automode_active());
         } else {
@@ -3145,11 +3357,18 @@ void GameRuntime::RuntimeState::set_skip_mode(bool enabled) {
     if (!now_active) {
         reveal_all_text(); // reveal on skip exit so new text is not stuck
     }
+    // s.status.* 必须在事件分发**之前**落地：框架的 commandskip_in_se
+    // 用 `$s.status.commandskip` 决定画不画左上角的 SKIP 标识，读到的是
+    // 上一帧的旧值就会走"开始时又结束"的分支。
+    sync_control_status();
     dispatch_mode_input(now_active ? "commandskipin" : "commandskipout");
 }
 
 void GameRuntime::RuntimeState::set_automode_mode(bool enabled) {
-    if (enabled && !control_.automode_allowed_) return;
+    // allow は「キーで入れるか」だけを決める（handle_role_key_edge が見る）。
+    // スクリプトの [exec command="automode"] はここへ直接来る —— test13 の
+    // automode_start は [automode allow="0"] を書いてから exec するので、
+    // ここで allow を見るとオートが永久に入らなくなる（ボタン無反応）。
     if (enabled && skip_active()) set_skip_mode(false);
     const bool was_active = automode_active();
     control_.automode_ = enabled;
@@ -3158,6 +3377,9 @@ void GameRuntime::RuntimeState::set_automode_mode(bool enabled) {
     // (autoskip.lua) also clears it with [automode syncse=""], this makes the
     // native exec path symmetric so a later native re-entry starts ungated.
     if (!automode_active()) control_.automode_syncse_.clear();
+    // 同上：automode_in_se / automode_out_se 读 `$s.status.automode`
+    // 决定 AUTO 图标的显隐，镜像必须先于事件落地。
+    sync_control_status();
     dispatch_mode_input(automode_active() ? "automodein" : "automodeout");
 }
 
@@ -3171,6 +3393,7 @@ void GameRuntime::RuntimeState::update_control_skip_hold(const std::set<int>& ke
     const bool now_effective = control_skip_effective();
     if (was_effective == now_effective) return;
     if (!now_effective) reveal_all_text();
+    sync_control_status();
     dispatch_mode_input(now_effective ? "controlskipin" : "controlskipout");
 }
 
@@ -3198,6 +3421,10 @@ void GameRuntime::RuntimeState::apply_automode_config(const std::map<std::string
         if (!allow && automode_active()) set_automode_mode(false);
         control_.automode_allowed_ = allow;
     }
+    // stopbyclick: プレイヤーのクリックでオートを止める（既定 on）。
+    const auto stop_it = params.find("stopbyclick");
+    if (stop_it != params.end())
+        control_.automode_stopbyclick_ = parse_i32(stop_it->second, 1) != 0;
     // syncse: automode flip waits for these voice ids to stop.
     const auto sync_it = params.find("syncse");
     if (sync_it != params.end()) control_.automode_syncse_ = sync_it->second;
@@ -3234,8 +3461,70 @@ void GameRuntime::RuntimeState::apply_exec_command(const std::map<std::string, s
     }
 }
 
+void GameRuntime::RuntimeState::sync_control_status() {
+    if (!interpreter_) return;
+    // 框架（artemis.lua / autoskip.lua / vsync.lua）不直接问引擎，只读
+    // `s.status.*`：get_skip() 看 commandskip/controlskip，紧急回避看 avoid。
+    // 这些是瞬态值，不参与存盘（syssave 跳过 s.status. 前缀）。
+    // 框架状态镜像：automode 与 skip 一样是 s.status.* 家族的一员，
+    // 脚本用 `$s.status.automode` 选择 AUTO 图标与按钮分支。
+    interpreter_->set_variable("s.status.automode",
+                               oa::runtime::Value::make_int(automode_active() ? 1 : 0));
+    interpreter_->set_variable("s.status.commandskip",
+                               oa::runtime::Value::make_int(skip_active() ? 1 : 0));
+    interpreter_->set_variable("s.status.controlskip",
+                               oa::runtime::Value::make_int(control_skip_effective() ? 1 : 0));
+    interpreter_->set_variable("s.status.avoid",
+                               oa::runtime::Value::make_int(control_.avoid_active_ ? 1 : 0));
+}
+
+void GameRuntime::RuntimeState::start_avoid() {
+    if (control_.avoid_active_ || control_.avoid_file_.empty()) return;
+    control_.avoid_active_ = true;
+    // 「音声・画面の動作を停止」——全音声を止め、映像も止める。
+    if (automode_active()) set_automode_mode(false);
+    if (skip_active()) set_skip_mode(false);
+    media_.audio_.stop_all_sounds();
+    if (media_.media_players_) media_.media_players_->stop_all();
+    media_.video_.stop_all_videos();
+    // 最前面（overlay スロット）に全画面で置く。id ソートでは数値 < 文字列
+    // なので "9999" ではメッセージ層に負ける —— overlay スロットだけが
+    // 構造的に「最後に描く」。
+    std::map<std::string, std::string> props;
+    props["file"] = control_.avoid_file_;
+    props["left"] = "0";
+    props["top"] = "0";
+    props["width"] = std::to_string(stage_width());
+    props["height"] = std::to_string(rt_->project_.config.stage_height);
+    scene().set_overlay_file();
+    // create（不是 set_props）：file 键只在 Create 路径上绑定到
+    // Layer::file（set_props 只把它当 verbatim 属性）。
+    scene().create(oa::render::kOverlayNodeId, props);
+    renderer_.note(RNote::Layer);
+    sync_control_status();
+    std::fprintf(stderr, "[runtime] avoid: on (%s)\n", control_.avoid_file_.c_str());
+}
+
+void GameRuntime::RuntimeState::end_avoid() {
+    if (!control_.avoid_active_) return;
+    control_.avoid_active_ = false;
+    scene().clear_overlay_file();
+    renderer_.note(RNote::Layer);
+    sync_control_status();
+    std::fprintf(stderr, "[runtime] avoid: off\n");
+}
+
 bool GameRuntime::RuntimeState::apply_control_config(const oa::runtime::Event& e) {
     if (e.kind != oa::runtime::Event::Kind::ConfigEvent) return false;
+    if (e.tag == "avoid") {
+        // [avoid file=... windowbutton=0] —— 緊急回避で出す画像。
+        // 実体は role 15 が来たときに最前面へ出す（start_avoid）。
+        const auto file = e.params.find("file");
+        if (file != e.params.end()) control_.avoid_file_ = file->second;
+        const auto wb = e.params.find("windowbutton");
+        if (wb != e.params.end()) control_.avoid_windowbutton_ = parse_i32(wb->second, 1) != 0;
+        return true;
+    }
     if (e.tag == "keyconfig") {
         apply_keyconfig(e.params);
         return true;
@@ -3383,6 +3672,8 @@ struct App::Impl {
     Clock::time_point last_tick{};
     uint64_t frames = 0;
     bool quit = false;
+    /// 最近一次 tick 抛出的异常文本（宿主拿来弹窗/落盘，不再是静默退出）。
+    std::string last_error;
 
     bool boot();
     AppResult tick();
@@ -3600,6 +3891,7 @@ AppResult App::Impl::tick()
         rt->tick(delta > 0 ? delta : 1);
     } catch (const std::exception& e) {
         std::fprintf(stderr, "[app] tick error: %s\n", e.what());
+        last_error = e.what();
         return AppResult::Error;
     }
     if (rt->exit_requested()) quit = true;
@@ -3723,6 +4015,8 @@ AppResult App::tick()
 {
     return impl_->tick();
 }
+
+const std::string& App::last_error() const { return impl_->last_error; }
 
 GameRuntime& App::runtime() { return *impl_->rt; }
 const GameRuntime& App::runtime() const { return *impl_->rt; }

@@ -134,8 +134,64 @@ GameRuntime::RuntimeState::sound_info_snapshot() const {
         (void)id;
         out.se.push_back(to_ch(c));
     }
+    // 原生 [voice] 通道和 SE 共用同一个 id 空间（stop_se/fade_se_gain 都同时
+    // 扫两张表），所以 get_sound_info 也必须一起报。漏掉它们时脚本侧的
+    // prevoice_out / voice_stop / bgm_fade_up_backlog 会把"正在播的语音"
+    // 当成没在播：旧语音不被停掉（叠音），BGM 也被提前恢复。
+    for (const auto& [id, c] : st.voice_channels) {
+        (void)id;
+        out.se.push_back(to_ch(c));
+    }
     std::sort(out.se.begin(), out.se.end(),
               [](const Ch& a, const Ch& b) { return a.id < b.id; });
+    return out;
+}
+
+std::optional<int32_t> GameRuntime::RuntimeState::realized_channel_gain(
+    const std::string& id) const {
+    if (!interpreter_ || id.empty()) return std::nullopt;
+    const auto v = interpreter_->variables().get("s.segain." + id);
+    if (!v) return std::nullopt;
+    const auto i = v->as_int();
+    if (!i) return std::nullopt;
+    int64_t g = *i;
+    if (g < 0) g = 0;
+    if (g > 1000) g = 1000;
+    return int32_t(g);
+}
+
+std::vector<GameRuntime::SoundChannelState> GameRuntime::RuntimeState::sound_state() const {
+    std::vector<SoundChannelState> out;
+    const auto& st = media_.audio_.state();
+    const float master = st.master_volume;
+    const auto add = [&](const char* cat, const oa::media::SoundChannel& ch, float bus) {
+        SoundChannelState s;
+        s.category = cat;
+        s.id = ch.id;
+        s.file = ch.file;
+        s.playing = ch.playing;
+        s.gain = ch.current_gain * bus * master;
+        double secs = 0.0;
+        bool unplayable = false;
+        const std::string player_id =
+            ch.category == oa::media::SoundCategory::Bgm ? std::string() : ch.id;
+        if (media_.media_players_ &&
+            media_.media_players_->decode_progress(ch.category, player_id, &secs,
+                                                   &unplayable)) {
+            s.decoded_seconds = secs;
+            s.decodable = !unplayable;
+        }
+        out.push_back(std::move(s));
+    };
+    if (st.bgm_channel) add("bgm", *st.bgm_channel, st.bgm_volume);
+    for (const auto& [id, ch] : st.se_channels) {
+        (void)id;
+        add("se", ch, st.se_volume);
+    }
+    for (const auto& [id, ch] : st.voice_channels) {
+        (void)id;
+        add("voice", ch, st.voice_volume);
+    }
     return out;
 }
 
@@ -162,6 +218,13 @@ void GameRuntime::RuntimeState::sync_system_audio_volumes() {
     if (se && se != media_.last_se_volume_) {
         media_.last_se_volume_ = se;
         media_.audio_.set_se_volume(*se);
+    }
+    // s.voicevol → 语音总线（框架里 VOICE 音量是可以独立设的实值；缺省不动，
+    // 否则会把引擎的 1.0 覆盖掉）。
+    const auto voice = read_volume("s.voicevol");
+    if (voice && voice != media_.last_voice_volume_) {
+        media_.last_voice_volume_ = voice;
+        media_.audio_.set_voice_volume(*voice);
     }
     // s.videovol → movie bus (absent = full volume).
     const auto movie = read_volume("s.videovol");
@@ -288,9 +351,11 @@ void GameRuntime::RuntimeState::advance_media_frame(uint64_t delta_ms) {
         finish_video(ev.id);
     }
     // Overlay video draws through the topmost compositor slot.
+    // 緊急回避（[avoid]）もこのスロットを使う：回避中に「動画が鳴っていない
+    // から」と毎フレーム clear すると、出した画像が 1 フレームで消える。
     if (media_.video_.is_overlay_playing()) {
         scene().set_overlay_file();
-    } else {
+    } else if (!control_.avoid_active_) {
         scene().clear_overlay_file();
     }
 }
@@ -455,7 +520,14 @@ bool GameRuntime::RuntimeState::apply_media_event(const oa::runtime::Event& e) {
         }
         oa::media::SeConfig cfg;
         cfg.loop_play = flag_on(param(e, "loop") ? *param(e, "loop") : "0", false);
-        if (const std::string* v = param(e, "gain")) cfg.gain = int32_t(parse_i64_raw(*v, 0));
+        if (const std::string* v = param(e, "gain")) {
+            cfg.gain = int32_t(parse_i64_raw(*v, 0));
+        } else if (const auto g = realized_channel_gain(id)) {
+            // 标签没写 gain= 时用框架算好的实值（s.segain.<通道id>）。
+            // 语音走的就是这条路：框架把它当成"这个声道的音量"，
+            // 并且在 voiceStartProc 里用同一个变量判断要不要播。
+            cfg.gain = *g;
+        }
         if (const std::string* v = param(e, "pan")) cfg.pan = int32_t(parse_i64_raw(*v, 0));
         if (const std::string* v = param(e, "time"))
             cfg.fade_in_ms = uint64_t(parse_i64_raw(*v, 0));

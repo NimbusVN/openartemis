@@ -720,6 +720,8 @@ int l_debug(lua_State* L) {
     } else {
         data = value_to_string(L, 2);
     }
+    if (std::getenv("OA_TAGDBG"))
+        std::fprintf(stderr, "[debug:%d] %s\n", level, data.c_str());
     return 0;
 }
 
@@ -818,22 +820,36 @@ int l_get_script_block(lua_State* L) {
     }
     const auto block = bridge->host().script_block(file, index);
     if (!block) {
-        lua_createtable(L, 0, 2);
+        lua_createtable(L, 0, 5);
         lua_pushliteral(L, "");
         lua_setfield(L, -2, "command");
         lua_createtable(L, 0, 0);
         lua_setfield(L, -2, "parameter");
+        lua_pushnumber(L, 0);
+        lua_setfield(L, -2, "line");
+        lua_pushnumber(L, (lua_Number)index);
+        lua_setfield(L, -2, "index");
+        lua_pushlstring(L, file, std::strlen(file));
+        lua_setfield(L, -2, "file");
         return 1;
     }
-    lua_createtable(L, 0, 2);
-    lua_pushlstring(L, block->first.data(), block->first.size());
+    lua_createtable(L, 0, 5);
+    lua_pushlstring(L, block->command.data(), block->command.size());
     lua_setfield(L, -2, "command");
-    lua_createtable(L, 0, (int)block->second.size());
-    for (const auto& [k, v] : block->second) {
+    lua_createtable(L, 0, (int)block->params.size());
+    for (const auto& [k, v] : block->params) {
         lua_pushlstring(L, v.data(), v.size());
         lua_setfield(L, -2, k.c_str());
     }
     lua_setfield(L, -2, "parameter");
+    // 框架的自动缓存读这个字段（syscache.iet: currentTag.line）；缺了会
+    // 在 tonumber(nil) 上炸掉。
+    lua_pushnumber(L, (lua_Number)block->line);
+    lua_setfield(L, -2, "line");
+    lua_pushnumber(L, (lua_Number)index);
+    lua_setfield(L, -2, "index");
+    lua_pushlstring(L, file, std::strlen(file));
+    lua_setfield(L, -2, "file");
     return 1;
 }
 
@@ -1371,6 +1387,11 @@ FilterDecision LuaBridge::run_tag_filter(const std::string& tag,
     }
     lua_pushcfunction(L_, l_traceback);
     lua_insert(L_, -4); // [handler, fn, engine, params]
+    struct FilterDepth {
+        int& d;
+        explicit FilterDepth(int& v) : d(v) { ++d; }
+        ~FilterDepth() { --d; }
+    } filter_depth(tag_filter_depth_);
     if (lua_pcall(L_, 2, 1, -4) != 0) {
         const std::string msg = lua_tostring(L_, -1) ? lua_tostring(L_, -1) : "lua error";
         lua_pop(L_, 2); // error + handler

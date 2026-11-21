@@ -79,16 +79,28 @@ struct ScetweenConfig {
 };
 
 /// backlog 页内再现标签（BacklogTag）。
+///
+/// `get_string()` 产出的是**框架的重放命令串**，不是给人看的标签：
+/// `name,key,val,key,val`（iMel/Artemis 的 backlog 把每条命令拆成逗号
+/// 数组存盘，`backlog.iet` 用 `string.find(s, ",")` 取命令名、
+/// `,__noreprint,1` / `,frexname,1` 判前缀；`save.iet`/`vsave.iet` 用
+/// `explode ","` 还原参数）。旧实现返回 `[print data="…"]` 这种**标签**，
+/// 回顾页按逗号切出来的 process 是整条字符串，一个分支都进不去 ——
+/// 行框、字体、坐标全对，字一个不画。
 struct BacklogTag {
-    enum class Kind { Text, LineBreak, Font, RubyStart, RubyEnd };
+    enum class Kind { Text, LineBreak, Font, FontInit, RubyStart, RubyEnd };
     Kind kind = Kind::Text;
     std::string text;
     std::map<std::string, std::string> font;
+    /// 行内其它命令的参数（`[rt noveldummystart="1"]` 的 dummy 标记等）。
+    std::map<std::string, std::string> params;
     std::string get_string() const;
 };
 
 struct BacklogPage {
     std::map<std::string, std::string> page_font;
+    /// 这一页的**重放命令**（print/font/rt…）。回顾跳转由框架自己的载体
+    /// 负责恢复画面，引擎只保存这一页怎么打出来。
     std::vector<BacklogTag> tags;
     bool has_text() const;
     std::vector<std::string> reproduction_tags(bool allfont) const;
@@ -124,6 +136,9 @@ struct LayoutConfig {
     std::string indent_pair;
     int indent_range = 0;
     bool indent_nest = false;
+    /// 舞台宽（宿主在创建渲染器时写入）。消息层既无字体表文本宽、又无绑定
+    /// 节点框宽时的最后兜底；0 = 未知（视为不折行）。
+    double stage_width = 0;
 };
 
 struct LaidGlyph {
@@ -166,6 +181,15 @@ struct MessageLayer {
     /// （is_message_layer_drawable 门槛,孤儿打印不绘制）。
     bool positioned = false;
     double left = 0, top = 0, width = 0, height = 0;
+    /// 绑定节点的逻辑框宽（消息窗纹理/裁剪窗的可见宽，宿主已扣除左右内边距）。
+    /// 只在 `width`（字体表显式文本宽）缺失时参与折行，见 layout_page 的
+    /// wrap_width 取值优先级。
+    double box_width = 0;
+    /// 当前生效的字体表缩放百分比（entirexscale/entireyscale，100 = 原样）。
+    /// 字体表分几段下发：底座带这个键，角色窗只补 width/height；后续分段
+    /// 要按同一因子换算，见 TextEngine::apply_font。
+    double entire_x = 100.0;
+    double entire_y = 100.0;
     FontDesc font;
     std::vector<FontDesc> font_stack;
     bool text_hidden = false;
@@ -213,6 +237,9 @@ struct TextProfile {
     std::vector<FontDesc> font_stack;
     bool positioned = false;
     double left = 0, top = 0, width = 0, height = 0;
+    double box_width = 0;
+    double entire_x = 100.0;
+    double entire_y = 100.0;
     std::vector<ScetweenConfig> scetween;
     bool valid = false;
 };
