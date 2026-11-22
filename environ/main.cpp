@@ -185,6 +185,7 @@ void print_usage(const char* argv0)
         "  --fps N              target frame rate (default: real-time pacing)\n"
         "  --platform NAME      project platform (default: build OS)\n"
         "  --renderer NAME      'sdl' (default) or 'gles'\n"
+        "  --save-dir PATH      writable save directory (overrides OA_SAVE_ROOT)\n"
         "  --mute               mute audio\n"
         "  -h, --help           show this help\n"
         "\n"
@@ -278,6 +279,10 @@ int parse_args(int argc, char** argv, oa::runtime::AppConfig& cfg)
             std::string v;
             if (!value_of(v) || v.empty()) return usage_error("--renderer needs a name");
             cfg.renderer = v;
+        } else if (name == "--save-dir") {
+            std::string v;
+            if (!value_of(v) || v.empty()) return usage_error("--save-dir needs a path");
+            cfg.save_root = v;
         } else if (!a.empty() && a[0] == '-' && a != "-") {
             return usage_error("unknown option '" + a + "'");
         } else {
@@ -453,12 +458,15 @@ SDL_AppResult SDL_AppInit(void** appstate, int argc, char* argv[])
     oa::plat::init();
     host->plat_inited = true;
 
-    if (const char* root = std::getenv("OA_SAVE_ROOT"); root && *root) {
-        cfg.save_root = root;
-    } else {
-        std::error_code ec;
-        const bool is_dir = std::filesystem::is_directory(cfg.project, ec);
-        cfg.save_root = oa::plat::default_save_root(cfg.project, is_dir);
+    // 存档根：命令行优先，其次环境变量（Android 壳历史写法），最后平台默认。
+    if (cfg.save_root.empty()) {
+        if (const char* root = std::getenv("OA_SAVE_ROOT"); root && *root) {
+            cfg.save_root = root;
+        } else {
+            std::error_code ec;
+            const bool is_dir = std::filesystem::is_directory(cfg.project, ec);
+            cfg.save_root = oa::plat::default_save_root(cfg.project, is_dir);
+        }
     }
     const std::string renderer = cfg.renderer;
 
